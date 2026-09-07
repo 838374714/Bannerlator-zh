@@ -116,6 +116,48 @@ object EaSupport {
         return null
     }
 
+    /**
+     * Steam appId for an EA shortcut. The tagged `steamAppId` extra first; else — shortcuts written before
+     * that tag existed (Steam downloads from before 2026-08) — match [installDir] against the installed-games
+     * DB (same folder, then same folder name), then a `steam_appid.txt` an earlier launch left in the folder.
+     * A derived id is stamped back onto the shortcut (with storeSource=steam when untagged) so every later
+     * lookup is a plain read. Returns 0 when unresolvable. Off the main thread (DB).
+     */
+    @JvmStatic
+    fun resolveSteamAppId(shortcut: Shortcut, installDir: File?): Int {
+        shortcut.getExtra("steamAppId", "").trim().toIntOrNull()?.takeIf { it > 0 }?.let { return it }
+        if (installDir == null) return 0
+        var appId = 0
+        try {
+            val want = installDir.canonicalPath.trimEnd('/')
+            val rows = SteamRepository.getInstance().database.installedGames ?: emptyList()
+            fun rowDir(r: SteamDatabase.GameRow): File? = r.installDir?.takeIf { it.isNotBlank() }?.let { File(it) }
+            appId = rows.firstOrNull { r -> rowDir(r)?.let { runCatching { it.canonicalPath.trimEnd('/') == want }.getOrDefault(false) } == true }?.appId
+                ?: rows.firstOrNull { r -> rowDir(r)?.name.equals(installDir.name, ignoreCase = true) }?.appId
+                ?: 0
+        } catch (e: Exception) {
+            Log.w(TAG, "resolveSteamAppId: DB match failed for ${shortcut.name}", e)
+        }
+        if (appId <= 0) {
+            appId = try {
+                File(installDir, "steam_appid.txt").takeIf { it.isFile }?.readText()?.trim()?.toIntOrNull() ?: 0
+            } catch (e: Exception) { 0 }
+        }
+        if (appId > 0) {
+            try {
+                shortcut.putExtra("steamAppId", appId.toString())
+                if (shortcut.getExtra("storeSource", "").isEmpty()) shortcut.putExtra("storeSource", "steam")
+                shortcut.saveData()
+                Log.i(TAG, "stamped steamAppId=$appId on legacy shortcut '${shortcut.name}' (container ${shortcut.container.id})")
+            } catch (e: Exception) {
+                Log.w(TAG, "could not stamp steamAppId on ${shortcut.name}", e)
+            }
+        } else {
+            Log.w(TAG, "resolveSteamAppId: no appId for '${shortcut.name}' installDir=$installDir")
+        }
+        return appId
+    }
+
     /** True when the shortcut carries the EA tag (no disk access). */
     @JvmStatic
     fun isTagged(shortcut: Shortcut): Boolean = shortcut.getExtra(EXTRA_EA, "") == "1"
