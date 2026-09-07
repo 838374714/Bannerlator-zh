@@ -19,7 +19,7 @@ use jni::objects::{GlobalRef, JClass, JObject, JObjectArray, JString, JValue};
 use jni::sys::{jboolean, jint, jlong, JNI_FALSE, JNI_TRUE};
 use jni::{JNIEnv, JavaVM};
 
-use super::engine::{self, GogEvents, GogRequest, GogRunResult};
+use super::engine::{self, GogEvents, GogRequest, GogRunResult, PlanKind};
 
 pub const LOG_TAG: &str = "BL_GOG_DL";
 
@@ -209,6 +209,7 @@ pub extern "system" fn Java_com_winlator_star_store_blsteam_BlGogDownload_native
 pub extern "system" fn Java_com_winlator_star_store_blsteam_BlGogDownload_nativeStart(
     mut env: JNIEnv,
     _class: JClass,
+    kind: jint,
     depot_manifests: JObjectArray,
     cdn_base: JString,
     install_dir: JString,
@@ -233,6 +234,7 @@ pub extern "system" fn Java_com_winlator_star_store_blsteam_BlGogDownload_native
         return 0;
     };
     let request = GogRequest {
+        kind: PlanKind::from_i32(kind),
         depot_manifests: string_array_to_vec(&mut env, &depot_manifests),
         cdn_base: jstring_to_string(&mut env, &cdn_base).unwrap_or_default(),
         install_dir: jstring_to_string(&mut env, &install_dir).unwrap_or_default(),
@@ -243,7 +245,11 @@ pub extern "system" fn Java_com_winlator_star_store_blsteam_BlGogDownload_native
         sort_largest_first: sort_largest_first != JNI_FALSE,
         label: jstring_to_string(&mut env, &label).unwrap_or_else(|| "gog".to_string()),
     };
-    if request.cdn_base.is_empty() || request.install_dir.is_empty() || request.depot_manifests.is_empty() {
+    let needs_base = request.kind == PlanKind::Gen2Chunks;
+    if (needs_base && request.cdn_base.is_empty())
+        || request.install_dir.is_empty()
+        || request.depot_manifests.is_empty()
+    {
         android_log("nativeStart: invalid request (empty cdn base / install dir / manifests)");
         return 0;
     }

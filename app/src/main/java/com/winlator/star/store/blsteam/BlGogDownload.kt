@@ -59,6 +59,12 @@ object BlGogDownload {
 
     private const val TAG = "BL_GOG_DL"
 
+    /** gen2: depot manifests → chunk fetch + inflate + MD5 (base install, DLC, dependencies). */
+    const val KIND_GEN2_CHUNKS = 0
+
+    /** gen1: build manifest → per-file HTTP Range GET streamed to disk (`runGen1`). */
+    const val KIND_GEN1_RANGES = 1
+
     @Volatile
     private var available: Boolean? = null
 
@@ -80,10 +86,11 @@ object BlGogDownload {
     /**
      * Starts one download loop on a native thread and returns its handle (0 = not started; the
      * listener then receives NO callbacks). Inputs are what the manager already holds:
-     * @param depotManifests inflated gen2 depot-manifest JSON strings, in fetch order, already
-     *   filtered by product + language in Java.
-     * @param cdnBase the resolved secure-link base (`parseCdnUrl`, query string intact) or the
-     *   unauthenticated dependency store base.
+     * @param kind [KIND_GEN2_CHUNKS] or [KIND_GEN1_RANGES].
+     * @param depotManifests gen2: inflated depot-manifest JSON strings, in fetch order, already
+     *   filtered by product + language in Java; gen1: the inflated build manifest.
+     * @param cdnBase gen2: the resolved secure-link base (`parseCdnUrl`, query string intact) or
+     *   the unauthenticated dependency store base; gen1: "" (file URLs are in the manifest).
      * @param skipPaths files already completed by an earlier run of this same download (secure-link
      *   refresh re-run): counted done without re-hashing, no progress event.
      * @param maxWorkers Java pool size for this loop (`resolveDownloadThreads`, 8, or 1).
@@ -92,6 +99,7 @@ object BlGogDownload {
      */
     @JvmStatic
     fun start(
+        kind: Int,
         depotManifests: Array<String>,
         cdnBase: String,
         installDir: String,
@@ -106,7 +114,7 @@ object BlGogDownload {
         if (!isAvailable()) return 0L
         return try {
             nativeStart(
-                depotManifests, cdnBase, installDir, skipPaths, caBundlePath,
+                kind, depotManifests, cdnBase, installDir, skipPaths, caBundlePath,
                 maxWorkers, processWorkers, sortLargestFirst, label, listener,
             )
         } catch (t: Throwable) {
@@ -134,6 +142,7 @@ object BlGogDownload {
 
     @JvmStatic
     private external fun nativeStart(
+        kind: Int,
         depotManifests: Array<String>,
         cdnBase: String,
         installDir: String,

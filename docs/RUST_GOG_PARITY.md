@@ -19,12 +19,13 @@ fetch core). Crate `app/src/main/cpp/bl-steam-client/rust/` → `libblsteam.so`:
 
 ## 0. TL;DR
 
-- Java has **four** byte-fetch loops. Three share one chunk semantic
-  (`fetchChunkVerified` + `assembleDepotFile`) and all three go through the one Rust engine:
+- Java has **four** byte-fetch loops, all four go through the one Rust engine. Three share one
+  chunk semantic (`fetchChunkVerified` + `assembleDepotFile`) → `KIND_GEN2_CHUNKS`:
   **gen2 base install** (`runGen2`, N-thread pool, largest-first), **gen2 DLC install**
   (`doInstallDlc`, fixed 8 threads, manifest order), **dependency redist assembly**
   (`assembleDependencyInstaller`, sequential, unauthenticated store, no link refresh).
-  The fourth — **gen1 range downloads** (`runGen1`) — stays Java on purpose (§9).
+  The fourth — **gen1 range downloads** (`runGen1`, one Range GET per file streamed to disk)
+  → `KIND_GEN1_RANGES` on the core's stream mode (§4b).
 - The engine is fed exactly what Java already holds after manifest + secure-link resolution:
   the inflated depot-manifest JSON strings (Java keeps them in `depotJsons` next to its own
   parse), the resolved CDN base, the install dir, the pool size. Token/builds/manifest head,
@@ -114,6 +115,19 @@ Both parsers run on the same strings; Java's `files.size()` (progress `total`) a
 | Pool join: `f.get()` on every future; exception → `"parallel download error: …"` | `:521` | n/a (blocking call; a JNI start failure → `anyFailed`) |
 | Tail: `cancelled` → `"cancelled"`; `anyFailed` → `"one or more chunks failed to download"`; else marker + prefs + exe | `:523`-`:571` | Java (shared) |
 
+## 4b. Gen1 loop (`runGen1` ↔ `run_gen1` / `Gen1Sink`, core stream mode)
+
+| Rule | Java line(s) | Rust status |
+|---|---|---|
+| Manifest: `depot[]` minus `support: true`; `files[]` → `path`, `url`, `offset` (0), `size` (0); dropped iff `size == 0` (the `null` checks never fire — `optString` returns "") | `:905`-`:922` | 1:1 (`parse_gen1_manifest`, tests) |
+| Pool = `resolveDownloadThreads`; one task per file | `:947`-`:951` | ≈ same N as ceiling + `per_host_cap`; one host key (first file's URL) |
+| Resume: `exists && length == size` → `doneG1++`, `"Resuming…"` at `15 + done/total*80`, no bytes | `:960`-`:966` | 1:1 (size-only, same string via `verifiedMsg`) |
+| Attempt: `outFile.delete()`, Range `bytes=<offset>-<offset+size-1>`, no auth header, 30 s/30 s, body streamed to `FileOutputStream`; no size/hash check | `:968`-`:973`, `downloadRange` `:1449` | 1:1 semantics — `FetchItem.range`, stream mode (`on_chunk` at `offset == 0` deletes + recreates the file, pieces written at their offset, `on_finish` = success, no check); UA `GOG Galaxy` where Java sent the platform default |
+| Retry: 3 attempts, 1 s / 2 s sleep; failure → `anyFailedG1` → `"one or more gen1 files failed to download"` | `:968`, `:994`-`:1002` | ≈ core ≤5 attempts + its back-off; failure → `anyFailed` → the same Java tail |
+| Success: `doneG1++`, `totalBytesG1 += size`, 500 ms speed window, `"Downloading: <name>  <speed>"` | `:974`-`:990` | 1:1 (same listener code, `showSpeed = true`) |
+| Partial file after a failed last attempt / cancel stays on disk (Java only deletes at the START of an attempt) | `:970` | 1:1 (no cleanup; a wrong-size partial fails the size-match resume; base cancel deletes the dir) |
+| Tail: `cancelled` → `"cancelled"`; `anyFailedG1` → error; prefs `gog_dir_`; exe candidates | `:1012`-`:1029` | Java (shared) |
+
 ## 5. Cancel / pause semantics and on-disk state
 
 | Rule | Java line(s) | Rust status |
@@ -169,13 +183,8 @@ Both parsers run on the same strings; Java's `files.size()` (progress `total`) a
 
 ## 9. Not ported (stays Java on both engines)
 
-- **Gen1 (`runGen1`, `:882`-`:1029`).** Range GETs (`bytes=<offset>-<offset+size-1>`) of whole
-  files (up to GBs) streamed to disk, size-only resume, 3 attempts with `outFile.delete()`
-  and 1 s/2 s backoff. The shared core buffers each item body in memory, so a gen1 item would
-  be a multi-GB `Vec<u8>` — an OOM, not a parity question. Left byte-identical; would need a
-  streaming sink in the core to port.
-- **Installer fallback (`runInstaller`, `:1104`).** Single `.exe` stream with progress; no
-  chunk semantics. Left as is.
+- **Installer fallback (`runInstaller`, `:1104`).** Single `.exe` stream with byte-level progress
+  ("Downloading: <exe>  <speed>" per read); no chunk semantics, no resume, no retry. Left as is.
 - Everything in §§1-2 and §§6-7.
 
 ## 10. Verification (device)
@@ -190,3 +199,5 @@ Both parsers run on the same strings; Java's `files.size()` (progress `total`) a
 3. Cancel mid-download: `summary … cancelled=true`, install dir gone (base) / no `.bhtmp` left (DLC).
 4. Re-run (Verify/Repair): every file reports `Verified…`, `pending_chunks=0`, `nothing to fetch`.
 5. Flag OFF: `engine=java` in `bh_gog_debug.txt`, no `BL_GOG_DL` lines — the loop is the old one.
+6. Gen1 title (a build with `generation=1` only): `engine=rust kind=gen1 label=gog gen1=<id>`,
+   `fetch-start … mode=stream`, `plan resumed=… pending_files=…`, per-file "Downloading:" lines.

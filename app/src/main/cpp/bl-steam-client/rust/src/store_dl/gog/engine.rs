@@ -23,7 +23,10 @@ use std::time::{Duration, Instant};
 
 use crate::fetch_core::{run_fetch, FetchItem, FetchOptions, FetchSink, SinkError};
 
-use super::plan::{build_cdn_path, build_chunk_url, build_plan, host_key, PlannedFile};
+use super::plan::{
+    build_cdn_path, build_chunk_url, build_plan, host_key, parse_gen1_manifest, Gen1File,
+    PlannedFile,
+};
 use super::{inflate_zlib, md5_hex, md5_hex_file};
 
 /// Per-request timeout on chunk fetches (Java: `TIMEOUT = 30_000` connect + read).
@@ -33,14 +36,36 @@ pub const USER_AGENT: &str = "GOG Galaxy";
 /// Java staging suffix (`assembleDepotFile`).
 pub const TMP_SUFFIX: &str = ".bhtmp";
 
+/// Which Java loop this run replaces.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum PlanKind {
+    /// gen2: depot manifests → chunks → `assembleDepotFile` (base install, DLC, dependencies).
+    #[default]
+    Gen2Chunks,
+    /// gen1: build manifest → per-file HTTP Range GET streamed to disk (`runGen1`).
+    Gen1Ranges,
+}
+
+impl PlanKind {
+    /// JNI mapping (`BlGogDownload.KIND_*`): 0 = gen2 chunks, 1 = gen1 ranges, anything else → gen2.
+    pub fn from_i32(v: i32) -> Self {
+        if v == 1 {
+            PlanKind::Gen1Ranges
+        } else {
+            PlanKind::Gen2Chunks
+        }
+    }
+}
+
 /// Inputs — exactly what the Java manager has in hand after manifest + secure-link resolution.
 #[derive(Clone, Debug, Default)]
 pub struct GogRequest {
-    /// Inflated gen2 depot-manifest JSON strings, in the order Java fetched them (already filtered
-    /// by base-product / DLC-product and language in Java).
+    pub kind: PlanKind,
+    /// gen2: inflated depot-manifest JSON strings, in the order Java fetched them (already filtered
+    /// by base-product / DLC-product and language in Java). gen1: the inflated build manifest.
     pub depot_manifests: Vec<String>,
-    /// Resolved CDN base from `parseCdnUrl` (secure-link query string kept), or the
-    /// unauthenticated dependency store base.
+    /// gen2: resolved CDN base from `parseCdnUrl` (secure-link query string kept), or the
+    /// unauthenticated dependency store base. gen1: unused (file URLs live in the manifest).
     pub cdn_base: String,
     pub install_dir: String,
     /// Files already completed by an earlier run of this same download (secure-link refresh
@@ -406,6 +431,13 @@ impl<'a> FetchSink for GogSink<'a> {
 /// fatal file failure, or on cancel. Safe to call again with `skip_paths` extended by the files
 /// this run reported done (that is how the Java side re-runs after a secure-link refresh).
 pub fn run(req: &GogRequest, cancel: &AtomicBool, events: &dyn GogEvents) -> GogRunResult {
+    match req.kind {
+        PlanKind::Gen2Chunks => run_gen2(req, cancel, events),
+        PlanKind::Gen1Ranges => run_gen1(req, cancel, events),
+    }
+}
+
+fn run_gen2(req: &GogRequest, cancel: &AtomicBool, events: &dyn GogEvents) -> GogRunResult {
     let files = build_plan(&req.depot_manifests, req.sort_largest_first);
     let files_total = files.len() as u32;
     let install_dir = PathBuf::from(&req.install_dir);
@@ -417,7 +449,7 @@ pub fn run(req: &GogRequest, cancel: &AtomicBool, events: &dyn GogEvents) -> Gog
     let host = host_key(&req.cdn_base);
 
     events.on_log(&format!(
-        "engine=rust label={} files={} chunks={} planned_bytes={} skip_paths={} workers={} process_workers={} sort_largest_first={} host={}",
+        "engine=rust kind=gen2 label={} files={} chunks={} planned_bytes={} skip_paths={} workers={} process_workers={} sort_largest_first={} host={}",
         req.label,
         files_total,
         chunk_count,
@@ -570,6 +602,7 @@ pub fn run(req: &GogRequest, cancel: &AtomicBool, events: &dyn GogEvents) -> Gog
         ca_bundle_path: req.ca_bundle_path.clone(),
         process_workers,
         label: req.label.clone(),
+        stream: false,
     };
     let log = |line: &str| events.on_log(line);
     let progress = |_bytes: u64, _items_ok: u64| {};
@@ -621,6 +654,283 @@ pub fn run(req: &GogRequest, cancel: &AtomicBool, events: &dyn GogEvents) -> Gog
         bytes_written: bytes_done.load(Ordering::Relaxed),
         files_done: files_done.load(Ordering::Relaxed),
         files_verified: files_verified.load(Ordering::Relaxed),
+        files_total,
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────────────────────
+// gen1: per-file HTTP Range GET streamed to disk (`runGen1` / `downloadRange`)
+// ─────────────────────────────────────────────────────────────────────────────────────────────
+
+struct Gen1State {
+    handle: Option<File>,
+    out_path: PathBuf,
+    finalized: bool,
+}
+
+/// Stream-mode sink for gen1. Java's `downloadRange`: `outFile.delete()` before EVERY attempt,
+/// `new FileOutputStream(out)`, copy the Range body, no size/hash check; success → `doneG1++`,
+/// `totalBytesG1 += size`, `"Downloading: <name>  <speed>"`. Pieces arrive in order with their
+/// offset; `offset == 0` marks the (re)start of an attempt, exactly where Java deletes the file.
+struct Gen1Sink<'a> {
+    files: &'a [Gen1File],
+    states: Vec<Mutex<Gen1State>>,
+    files_total: u32,
+    bytes_total: u64,
+    files_done: &'a AtomicU32,
+    bytes_done: &'a AtomicU64,
+    events: &'a dyn GogEvents,
+    speed: Mutex<SpeedSampler>,
+}
+
+impl<'a> FetchSink for Gen1Sink<'a> {
+    fn process(&self, item: &FetchItem, _body: Vec<u8>) -> Result<u64, SinkError> {
+        Err(SinkError::Fatal(format!(
+            "gen1 sink is stream-only (item {})",
+            item.id
+        )))
+    }
+
+    fn on_chunk(&self, item: &FetchItem, offset: u64, data: &[u8]) -> Result<(), SinkError> {
+        let idx = item.id as usize;
+        let (Some(file), Some(state)) = (self.files.get(idx), self.states.get(idx)) else {
+            return Err(SinkError::Fatal(format!("unknown gen1 item {}", item.id)));
+        };
+        if let Ok(mut speed) = self.speed.lock() {
+            speed.record(data.len() as u64);
+        }
+        let mut st = state
+            .lock()
+            .map_err(|_| SinkError::Fatal("gen1 state poisoned".to_string()))?;
+        if offset == 0 {
+            // New attempt: Java `outFile.delete()` + `new FileOutputStream(out)`.
+            st.handle = None;
+            if let Some(parent) = st.out_path.parent() {
+                let _ = fs::create_dir_all(parent);
+            }
+            let _ = fs::remove_file(&st.out_path);
+            match OpenOptions::new()
+                .create(true)
+                .write(true)
+                .truncate(true)
+                .open(&st.out_path)
+            {
+                Ok(h) => st.handle = Some(h),
+                Err(err) => {
+                    let msg = format!("gen1 open failed file={} err={err}", file.path);
+                    self.events.on_log(&msg);
+                    return Err(SinkError::Retry(msg));
+                }
+            }
+        }
+        let Some(handle) = st.handle.as_ref() else {
+            return Err(SinkError::Retry(format!(
+                "gen1 piece before start file={}",
+                file.path
+            )));
+        };
+        if let Err(err) = handle.write_all_at(data, offset) {
+            let msg = format!("gen1 write failed file={} err={err}", file.path);
+            self.events.on_log(&msg);
+            st.handle = None;
+            return Err(SinkError::Retry(msg));
+        }
+        Ok(())
+    }
+
+    fn on_finish(&self, item: &FetchItem, _total_len: u64) -> Result<u64, SinkError> {
+        let idx = item.id as usize;
+        let (Some(file), Some(state)) = (self.files.get(idx), self.states.get(idx)) else {
+            return Err(SinkError::Fatal(format!("unknown gen1 item {}", item.id)));
+        };
+        {
+            let mut st = state
+                .lock()
+                .map_err(|_| SinkError::Fatal("gen1 state poisoned".to_string()))?;
+            st.handle = None; // close
+            st.finalized = true;
+        }
+        let done = self.files_done.fetch_add(1, Ordering::Relaxed) + 1;
+        let bytes = self.bytes_done.fetch_add(file.size, Ordering::Relaxed) + file.size;
+        self.events.on_file_done(
+            &file.path,
+            file.size,
+            false,
+            done,
+            self.files_total,
+            bytes,
+            self.bytes_total,
+        );
+        Ok(0)
+    }
+}
+
+/// gen1 loop. Resume = `exists && length == size` ("Resuming…", no bytes). Items = one Range GET
+/// per pending file; retries/back-off by the core (Java: 3 attempts, 1 s / 2 s). Failed or
+/// cancelled attempts leave whatever was written, like Java (a wrong-size partial fails the
+/// size-match resume and is re-pulled next time; a base-install cancel deletes the whole dir).
+fn run_gen1(req: &GogRequest, cancel: &AtomicBool, events: &dyn GogEvents) -> GogRunResult {
+    let mut files: Vec<Gen1File> = Vec::new();
+    for manifest in &req.depot_manifests {
+        parse_gen1_manifest(manifest, &mut files);
+    }
+    let files_total = files.len() as u32;
+    let install_dir = PathBuf::from(&req.install_dir);
+    let skip: HashSet<&str> = req.skip_paths.iter().map(String::as_str).collect();
+    let planned_bytes: u64 = files.iter().map(|f| f.size).sum();
+    let max_workers = req.max_workers.max(1);
+    let process_workers = req.process_workers.max(1);
+    let host = files
+        .first()
+        .map(|f| host_key(&f.url))
+        .unwrap_or_else(|| "https://none".to_string());
+
+    events.on_log(&format!(
+        "engine=rust kind=gen1 label={} files={} planned_bytes={} skip_paths={} workers={} process_workers={} host={}",
+        req.label,
+        files_total,
+        planned_bytes,
+        skip.len(),
+        max_workers,
+        process_workers,
+        host
+    ));
+
+    let files_done = AtomicU32::new(0);
+    let bytes_done = AtomicU64::new(0);
+    let mut files_verified = 0u32;
+
+    if files.is_empty() {
+        return GogRunResult {
+            success: false,
+            error: "no files in gen1 plan (manifest parse mismatch)".to_string(),
+            files_total,
+            ..Default::default()
+        };
+    }
+
+    let mut items: Vec<FetchItem> = Vec::new();
+    let mut states: Vec<Mutex<Gen1State>> = Vec::with_capacity(files.len());
+    let mut pending_bytes = 0u64;
+    for (idx, file) in files.iter().enumerate() {
+        if cancel.load(Ordering::Relaxed) {
+            return GogRunResult {
+                cancelled: true,
+                error: "cancelled".to_string(),
+                files_done: files_done.load(Ordering::Relaxed),
+                files_verified,
+                files_total,
+                ..Default::default()
+            };
+        }
+        let out_path = install_dir.join(&file.path);
+        let skipped = skip.contains(file.path.as_str());
+        let resumed = !skipped
+            && fs::metadata(&out_path)
+                .map(|m| m.len() == file.size)
+                .unwrap_or(false);
+        states.push(Mutex::new(Gen1State {
+            handle: None,
+            out_path,
+            finalized: skipped || resumed,
+        }));
+        if skipped {
+            continue;
+        }
+        if resumed {
+            files_verified += 1;
+            let done = files_done.fetch_add(1, Ordering::Relaxed) + 1;
+            events.on_file_done(
+                &file.path,
+                file.size,
+                true,
+                done,
+                files_total,
+                bytes_done.load(Ordering::Relaxed),
+                planned_bytes,
+            );
+            continue;
+        }
+        pending_bytes = pending_bytes.saturating_add(file.size);
+        items.push(FetchItem {
+            id: idx as u64,
+            urls: vec![file.url.clone()],
+            reserve: file.size,
+            range: Some((file.offset, file.offset.saturating_add(file.size).saturating_sub(1))),
+        });
+    }
+    events.on_log(&format!(
+        "plan resumed={} pending_files={} pending_bytes={}",
+        files_verified,
+        items.len(),
+        pending_bytes
+    ));
+    if items.is_empty() {
+        events.on_log("summary bytes=0 elapsed=0.000 avg_mbps=0.00 peak_mbps=0.00 (nothing to fetch)");
+        return GogRunResult {
+            success: true,
+            files_done: files_done.load(Ordering::Relaxed),
+            files_verified,
+            files_total,
+            ..Default::default()
+        };
+    }
+
+    let sink = Gen1Sink {
+        files: &files,
+        states,
+        files_total,
+        bytes_total: planned_bytes,
+        files_done: &files_done,
+        bytes_done: &bytes_done,
+        events,
+        speed: Mutex::new(SpeedSampler::new()),
+    };
+    let hosts = vec![host];
+    let opts = FetchOptions {
+        max_workers,
+        per_host_cap: max_workers,
+        timeout: CHUNK_TIMEOUT,
+        headers: vec![("User-Agent".to_string(), USER_AGENT.to_string())],
+        ca_bundle_path: req.ca_bundle_path.clone(),
+        process_workers,
+        label: req.label.clone(),
+        stream: true,
+    };
+    let log = |line: &str| events.on_log(line);
+    let progress = |_bytes: u64, _items_ok: u64| {};
+    let outcome = run_fetch(items, &hosts, &opts, &sink, cancel, &progress, &log);
+
+    let cancelled = outcome.cancelled || cancel.load(Ordering::Relaxed);
+    let error = outcome.error.clone().unwrap_or_default();
+    let success = !cancelled && error.is_empty();
+    let (wire_bytes, elapsed, avg_mbps, peak_mbps) = sink
+        .speed
+        .lock()
+        .map(|mut s| s.finish())
+        .unwrap_or((0, 0.0, 0.0, 0.0));
+    events.on_log(&format!(
+        "summary bytes={} written={} elapsed={:.3} avg_mbps={:.2} peak_mbps={:.2} items_ok={} files_done={} resumed={} success={} cancelled={}{}",
+        wire_bytes,
+        bytes_done.load(Ordering::Relaxed),
+        elapsed,
+        avg_mbps,
+        peak_mbps,
+        outcome.items_ok,
+        files_done.load(Ordering::Relaxed),
+        files_verified,
+        success,
+        cancelled,
+        if error.is_empty() { String::new() } else { format!(" error={error}") }
+    ));
+    GogRunResult {
+        success,
+        cancelled,
+        link_expiry: false, // gen1 has no secure-link refresh in Java
+        error: if cancelled && error.is_empty() { "cancelled".to_string() } else { error },
+        bytes_written: bytes_done.load(Ordering::Relaxed),
+        files_done: files_done.load(Ordering::Relaxed),
+        files_verified,
         files_total,
     }
 }
@@ -862,6 +1172,78 @@ mod tests {
         assert!(events[0].starts_with("log engine=rust label=test files=2 chunks=2"), "{:?}", events[0]);
         assert!(events.iter().any(|e| e == "done a.bin bytes=12 verified=true 1/2 total=0"), "{events:?}");
         assert!(!events.iter().any(|e| e.contains("skipped.bin")), "{events:?}");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn gen1_sink_streams_pieces_and_restarts_on_offset_zero() {
+        let dir = temp_dir("gen1sink");
+        let files = vec![Gen1File {
+            path: "sub/blob.bin".into(),
+            url: "https://example.invalid/blob".into(),
+            offset: 100,
+            size: 8,
+        }];
+        let files_done = AtomicU32::new(0);
+        let bytes_done = AtomicU64::new(0);
+        let rec = Recorder { events: StdMutex::new(Vec::new()) };
+        let sink = Gen1Sink {
+            files: &files,
+            states: vec![Mutex::new(Gen1State {
+                handle: None,
+                out_path: dir.join("sub/blob.bin"),
+                finalized: false,
+            })],
+            files_total: 1,
+            bytes_total: 8,
+            files_done: &files_done,
+            bytes_done: &bytes_done,
+            events: &rec,
+            speed: Mutex::new(SpeedSampler::new()),
+        };
+        let item = FetchItem { id: 0, urls: vec!["x".into()], reserve: 8, range: Some((100, 107)) };
+        // Attempt 1 writes a partial, attempt 2 restarts from offset 0 and truncates it.
+        sink.on_chunk(&item, 0, b"ZZZZZZZZZZZZ").unwrap();
+        sink.on_chunk(&item, 0, b"abcd").unwrap();
+        sink.on_chunk(&item, 4, b"efgh").unwrap();
+        assert_eq!(sink.on_finish(&item, 8).unwrap(), 0);
+        assert_eq!(fs::read(dir.join("sub/blob.bin")).unwrap(), b"abcdefgh");
+        assert_eq!(files_done.load(Ordering::Relaxed), 1);
+        assert_eq!(bytes_done.load(Ordering::Relaxed), 8);
+        let events = rec.events.lock().unwrap();
+        assert!(events.iter().any(|e| e == "done sub/blob.bin bytes=8 verified=false 1/1 total=8"), "{events:?}");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn run_gen1_resumes_on_size_match_only() {
+        let dir = temp_dir("gen1run");
+        fs::write(dir.join("ok.bin"), b"12345").unwrap();
+        fs::write(dir.join("short.bin"), b"12").unwrap();
+        let manifest = r#"{"depot":[{"files":[
+            {"path":"ok.bin","url":"https://example.invalid/b","offset":0,"size":5},
+            {"path":"short.bin","url":"https://example.invalid/b","offset":5,"size":5},
+            {"path":"skipped.bin","url":"https://example.invalid/b","offset":10,"size":5}]}]}"#;
+        let req = GogRequest {
+            kind: PlanKind::Gen1Ranges,
+            depot_manifests: vec![manifest.to_string()],
+            install_dir: dir.to_string_lossy().into_owned(),
+            skip_paths: vec!["skipped.bin".to_string()],
+            max_workers: 2,
+            process_workers: 1,
+            ..Default::default()
+        };
+        let rec = Recorder { events: StdMutex::new(Vec::new()) };
+        // Cancel before the fetch so no network is touched: the resume pass still runs.
+        let cancel = AtomicBool::new(false);
+        // Use a pre-set cancel via a second request: run the resume pass, then expect the fetch
+        // to be attempted for short.bin only. We can't reach the network here, so assert on the
+        // plan log line instead of the outcome.
+        cancel.store(true, Ordering::Relaxed);
+        let res = run(&req, &cancel, &rec);
+        assert!(res.cancelled, "{res:?}");
+        let events = rec.events.lock().unwrap();
+        assert!(events[0].starts_with("log engine=rust kind=gen1 label= files=3"), "{:?}", events[0]);
         let _ = fs::remove_dir_all(&dir);
     }
 

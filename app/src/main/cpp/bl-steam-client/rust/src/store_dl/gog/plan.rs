@@ -137,6 +137,53 @@ pub fn parse_depot_manifest(json: &str, out: &mut Vec<PlannedFile>) {
     }
 }
 
+/// One gen1 file: a byte range of a (pre-signed) depot blob (`GogDownloadManager.Gen1File`).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Gen1File {
+    /// Install-dir-relative path, used verbatim (Java's gen1 path does not normalise slashes).
+    pub path: String,
+    pub url: String,
+    pub offset: u64,
+    pub size: u64,
+}
+
+/// Parses a gen1 build manifest (`runGen1`): every `depot[]` entry that is not `support: true`,
+/// its `files[]` → (`path`, `url`, `offset` default 0, `size` default 0); an entry with
+/// `size == 0` is dropped (Java's `path == null || url == null` checks never fire — `optString`
+/// returns "" — so `size == 0` is the only effective filter, mirrored here).
+pub fn parse_gen1_manifest(json: &str, out: &mut Vec<Gen1File>) {
+    let Ok(root) = serde_json::from_str::<Value>(json) else {
+        return;
+    };
+    let Some(depots) = root.get("depot").and_then(Value::as_array) else {
+        return;
+    };
+    for depot in depots {
+        if !depot.is_object() {
+            continue;
+        }
+        if depot.get("support").and_then(Value::as_bool).unwrap_or(false) {
+            continue;
+        }
+        let Some(files) = depot.get("files").and_then(Value::as_array) else {
+            continue;
+        };
+        for f in files {
+            if !f.is_object() {
+                continue;
+            }
+            let path = opt_string(f, "path");
+            let offset = opt_u64(f, "offset");
+            let size = opt_u64(f, "size");
+            let url = opt_string(f, "url");
+            if size == 0 {
+                continue;
+            }
+            out.push(Gen1File { path, url, offset, size });
+        }
+    }
+}
+
 /// Parses every manifest in order (the order Java fetched the depots) and optionally applies the
 /// base-install largest-first (LPT) ordering — a STABLE sort by descending `total_size`, exactly
 /// `Collections.sort(files, (a, b) -> Long.compare(b.totalSize, a.totalSize))`. The DLC and
@@ -256,6 +303,32 @@ mod tests {
         let sorted = build_plan(&[m1, m2], true);
         let order: Vec<&str> = sorted.iter().map(|f| f.relative_path.as_str()).collect();
         assert_eq!(order, ["b", "c", "d", "a"], "stable: b (30) before c (30) keeps source order");
+    }
+
+    #[test]
+    fn gen1_parse_mirrors_run_gen1() {
+        let json = r#"{"installDirectory":"Game","depot":[
+            {"support":true,"files":[{"path":"support.bin","url":"u","offset":0,"size":5}]},
+            {"files":[
+                {"path":"a.bin","url":"https://cdn.gog.com/blob?t=1","offset":10,"size":20},
+                {"path":"zero.bin","url":"u","offset":0,"size":0},
+                {"path":"b.bin","url":"https://cdn.gog.com/blob?t=1","size":"7"},
+                "junk"
+            ]},
+            {"nofiles":true}
+        ]}"#;
+        let mut files = Vec::new();
+        parse_gen1_manifest(json, &mut files);
+        assert_eq!(
+            files,
+            vec![
+                Gen1File { path: "a.bin".into(), url: "https://cdn.gog.com/blob?t=1".into(), offset: 10, size: 20 },
+                Gen1File { path: "b.bin".into(), url: "https://cdn.gog.com/blob?t=1".into(), offset: 0, size: 7 },
+            ]
+        );
+        let mut none = Vec::new();
+        parse_gen1_manifest(r#"{"depots":[]}"#, &mut none);
+        assert!(none.is_empty());
     }
 
     #[test]

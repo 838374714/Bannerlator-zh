@@ -456,7 +456,8 @@ public final class GogDownloadManager {
             final boolean useRustEngine = useRustEngine(ctx);
             dbg.append("engine=").append(useRustEngine ? "rust" : "java").append("\n");
             if (useRustEngine) {
-                runRustChunkEngine(ctx, depotJsons, installPath,
+                runRustChunkEngine(ctx, com.winlator.star.store.blsteam.BlGogDownload.KIND_GEN2_CHUNKS,
+                        "Verified…", depotJsons, installPath,
                         cdnBaseRef, fSecureLinkUrl, token, cdnRefreshCount, MAX_CDN_REFRESH,
                         downloadThreads, downloadThreads, true, "gog base=" + baseProductId,
                         cancelled, anyFailed, doneCount, total, totalBytes,
@@ -787,7 +788,8 @@ public final class GogDownloadManager {
             final boolean useRustEngine = useRustEngine(ctx);
             GogCloudSaveManager.debug(ctx, dlgTag + " engine=" + (useRustEngine ? "rust" : "java"));
             if (useRustEngine) {
-                runRustChunkEngine(ctx, depotJsons, fInstallPath,
+                runRustChunkEngine(ctx, com.winlator.star.store.blsteam.BlGogDownload.KIND_GEN2_CHUNKS,
+                        "Verified…", depotJsons, fInstallPath,
                         cdnBaseRef, fSecureLinkUrl, fToken, cdnRefreshCount, MAX_CDN_REFRESH,
                         8, 8, false, "gog dlc=" + dlcProductId + " base=" + baseId,
                         cancelled, anyFailed, doneCount, total, new AtomicLong(0),
@@ -951,6 +953,18 @@ public final class GogDownloadManager {
             dbg.append("gen1 parallel download: ").append(totalG1)
                .append(" files, ").append(downloadThreadsG1).append(" threads\n");
 
+            // Engine switch — see runGen2. gen1: one Range GET per file streamed to disk, size-only
+            // resume ("Resuming…"), no secure-link refresh (cap 0), same speed string.
+            final boolean useRustEngineG1 = useRustEngine(ctx);
+            dbg.append("engine=").append(useRustEngineG1 ? "rust" : "java").append("\n");
+            if (useRustEngineG1) {
+                runRustChunkEngine(ctx, com.winlator.star.store.blsteam.BlGogDownload.KIND_GEN1_RANGES,
+                        "Resuming…", java.util.Collections.singletonList(manifestStr), installPath,
+                        new AtomicReference<>(""), null, null, new AtomicInteger(0), 0,
+                        downloadThreadsG1, downloadThreadsG1, false, "gog gen1=" + game.gameId,
+                        cancelled, anyFailedG1, doneG1, totalG1, totalBytesG1,
+                        lastSpeedMsG1, lastSpeedBG1, speedBpsG1, cb, true, null, fileLog1);
+            } else {
             ExecutorService poolG1 = Executors.newFixedThreadPool(downloadThreadsG1);
             List<Future<Void>> futuresG1 = new ArrayList<>();
             for (Gen1File gf : files) {
@@ -1008,6 +1022,7 @@ public final class GogDownloadManager {
                 poolG1.shutdownNow();
                 return "gen1 parallel error: " + e;
             }
+            } // end Java engine
             for (String line : fileLog1) dbg.append(line).append("\n");
             if (cancelled.get()) return "cancelled";
             if (anyFailedG1.get()) return "one or more gen1 files failed to download";
@@ -1387,7 +1402,8 @@ public final class GogDownloadManager {
             if (engineCtx != null && useRustEngine(engineCtx)) {
                 log.add("engine=rust (dependency)");
                 AtomicBoolean anyFailed = new AtomicBoolean(false);
-                runRustChunkEngine(engineCtx, java.util.Collections.singletonList(depManifestJson), destDir,
+                runRustChunkEngine(engineCtx, com.winlator.star.store.blsteam.BlGogDownload.KIND_GEN2_CHUNKS,
+                        "Verified…", java.util.Collections.singletonList(depManifestJson), destDir,
                         baseRef, null, null, refresh, 0,
                         1, 1, false, "gog dep=" + (wantTail == null ? "?" : wantTail),
                         cancelled, anyFailed, new AtomicInteger(0), files.size(), new AtomicLong(0),
@@ -1774,11 +1790,12 @@ public final class GogDownloadManager {
     }
 
     /**
-     * Drives the Rust engine for ONE gen2 chunk loop (base install, DLC install, or a dependency
-     * redist assembly), producing exactly what the Java pool loop produced:
+     * Drives the Rust engine for ONE fetch loop ({@code kind} = gen2 chunk loop for base install /
+     * DLC install / dependency redist assembly, or the gen1 range loop), producing exactly what
+     * the Java pool loop produced:
      * <ul>
-     *   <li>per verified (resume-skipped) file: {@code doneCount++}, {@code "Verified…"} at
-     *       {@code 15 + done/total*80};</li>
+     *   <li>per verified (resume-skipped) file: {@code doneCount++}, {@code verifiedMsg}
+     *       ({@code "Verified…"} gen2 / {@code "Resuming…"} gen1) at {@code 15 + done/total*80};</li>
      *   <li>per assembled file: {@code doneCount++}, {@code totalBytes += size}, the same 500 ms
      *       speed window and {@code "Downloading: <name>  <speed>"} string;</li>
      *   <li>the DLC written-file list gets both kinds, like the Java tasks;</li>
@@ -1792,7 +1809,8 @@ public final class GogDownloadManager {
      * Cancel is propagated by polling the caller's {@code cancelled} flag every 250 ms.
      */
     private static void runRustChunkEngine(
-            Context ctx, List<String> depotJsons, File installPath,
+            Context ctx, int kind, String verifiedMsg,
+            List<String> depotJsons, File installPath,
             AtomicReference<String> cdnBaseRef, String secureLinkUrl, String token,
             AtomicInteger cdnRefreshCount, int maxCdnRefresh,
             int maxWorkers, int processWorkers, boolean sortLargestFirst, String label,
@@ -1831,7 +1849,7 @@ public final class GogDownloadManager {
                     int done = doneCount.incrementAndGet();
                     int pct  = 15 + (int) ((done / (float) total) * 80);
                     if (verified) {
-                        if (cb != null) cb.onProgress("Verified…", pct);
+                        if (cb != null) cb.onProgress(verifiedMsg, pct);
                         return;
                     }
                     long tb = totalBytes.addAndGet(fileBytes);
@@ -1863,7 +1881,7 @@ public final class GogDownloadManager {
                 }
             };
             long handle = com.winlator.star.store.blsteam.BlGogDownload.start(
-                    manifests, base, installPath.getAbsolutePath(),
+                    kind, manifests, base, installPath.getAbsolutePath(),
                     donePaths.toArray(new String[0]), caPath,
                     maxWorkers, processWorkers, sortLargestFirst, label + " run=" + run, listener);
             if (handle == 0L) {
