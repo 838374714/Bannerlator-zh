@@ -4,17 +4,21 @@ import android.app.Activity
 import android.content.Context
 import android.content.Intent
 import android.net.Uri
+import android.widget.Toast
 import androidx.activity.compose.BackHandler
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
+import androidx.compose.foundation.ExperimentalFoundationApi
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
+import androidx.compose.foundation.combinedClickable
 import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.BoxWithConstraints
 import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.IntrinsicSize
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxHeight
@@ -113,7 +117,9 @@ import com.winlator.star.store.download.InstallProgressDialog
 import com.winlator.star.ui.screens.adrenodownload.DriverFeed
 import com.winlator.star.ui.screens.adrenodownload.DriverSourceStore
 import com.winlator.star.ui.screens.MenuItemDivider
+import com.winlator.star.ui.screens.OfficialSourceColor
 import com.winlator.star.ui.screens.OutlinedAlertDialog
+import com.winlator.star.ui.screens.SourceTagBadge
 import com.winlator.star.ui.screens.outlinedMenuCard
 import com.winlator.star.util.InAppFilePicker
 
@@ -410,8 +416,17 @@ private fun RepoCard(
             tint = cs.primary, modifier = Modifier.size(26.dp))
         Spacer(Modifier.width(14.dp))
         Column(modifier = Modifier.weight(1f)) {
-            Text(source.name, style = MaterialTheme.typography.titleSmall, color = cs.onSurface,
-                maxLines = 1, overflow = TextOverflow.Ellipsis, fontWeight = FontWeight.Bold)
+            // Name takes the slack and ellipsises; the Official tag is fixed-width so it never wraps
+            // the row, narrow or wide.
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                Text(source.name, style = MaterialTheme.typography.titleSmall, color = cs.onSurface,
+                    maxLines = 1, overflow = TextOverflow.Ellipsis, fontWeight = FontWeight.Bold,
+                    modifier = Modifier.weight(1f, fill = false))
+                if (source.isOfficial) {
+                    Spacer(Modifier.width(8.dp))
+                    SourceTagBadge("Official", OfficialSourceColor)
+                }
+            }
             Text(source.displayFormat, style = MaterialTheme.typography.bodySmall,
                 color = cs.onSurfaceVariant, maxLines = 1, overflow = TextOverflow.Ellipsis)
             if (pills.isNotEmpty()) {
@@ -475,8 +490,15 @@ private fun RepoDetail(vm: ContentsHubViewModel, showBack: Boolean) {
                 IconButton(onClick = { vm.selectSource(null) }) { Icon(Icons.Filled.ArrowBack, "Back", tint = cs.onSurface) }
             }
             Column(modifier = Modifier.weight(1f)) {
-                Text(src.name, style = MaterialTheme.typography.titleMedium, color = cs.onSurface,
-                    maxLines = 1, overflow = TextOverflow.Ellipsis, fontWeight = FontWeight.Bold)
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    Text(src.name, style = MaterialTheme.typography.titleMedium, color = cs.onSurface,
+                        maxLines = 1, overflow = TextOverflow.Ellipsis, fontWeight = FontWeight.Bold,
+                        modifier = Modifier.weight(1f, fill = false))
+                    if (src.isOfficial) {
+                        Spacer(Modifier.width(8.dp))
+                        SourceTagBadge("Official", OfficialSourceColor)
+                    }
+                }
                 Text("${src.displayFormat} · ${items.size} ${if (src.driverOnly) "drivers" else "components"}",
                     style = MaterialTheme.typography.bodySmall, color = cs.onSurfaceVariant)
             }
@@ -536,6 +558,8 @@ private fun ComponentRow(vm: ContentsHubViewModel, item: ContentsHubViewModel.Ca
     val savedKeys by vm.savedKeys.collectAsState()
     val registry by ContentDownloadRegistry.states.collectAsState()
 
+    val baseDisplay by vm.baseDisplay.collectAsState()
+
     // recompute cheap booleans against the observed sets
     val installed = installedKeys.let { vm.isInstalled(item) }
     val saved = savedKeys.let { vm.isSaved(item) }
@@ -582,10 +606,11 @@ private fun ComponentRow(vm: ContentsHubViewModel, item: ContentsHubViewModel.Ca
 
         if (state != null) {
             Spacer(Modifier.height(10.dp))
+            // A save-only run shares the key with an install; only the wording differs.
             val label = when (state.phase) {
                 ContentDownloadPhase.DOWNLOADING -> "Downloading ${(state.fraction * 100).toInt()}%"
-                ContentDownloadPhase.INSTALLING -> "Installing"
-                ContentDownloadPhase.DONE -> "Installed"
+                ContentDownloadPhase.INSTALLING -> if (state.saveOnly) "Saving to My Files" else "Installing"
+                ContentDownloadPhase.DONE -> if (state.saveOnly) "Saved" else "Installed"
                 ContentDownloadPhase.ERROR -> state.error ?: "Failed"
             }
             if (!state.terminal) {
@@ -598,7 +623,10 @@ private fun ComponentRow(vm: ContentsHubViewModel, item: ContentsHubViewModel.Ca
         }
 
         Spacer(Modifier.height(12.dp))
-        Row(horizontalArrangement = Arrangement.spacedBy(9.dp)) {
+        // Install button takes the slack; the save-only action is a fixed-width square matched to the
+        // button's height (IntrinsicSize.Min), so the pair never wraps in portrait or landscape.
+        Row(horizontalArrangement = Arrangement.spacedBy(9.dp), verticalAlignment = Alignment.CenterVertically,
+            modifier = Modifier.fillMaxWidth().height(IntrinsicSize.Min)) {
             if (installed) {
                 PrimaryButton("Installed", Icons.Filled.CheckCircle, enabled = false,
                     container = InstalledGreen.copy(alpha = 0.16f), content = InstalledGreen, modifier = Modifier.weight(1f)) {}
@@ -611,7 +639,41 @@ private fun ComponentRow(vm: ContentsHubViewModel, item: ContentsHubViewModel.Ca
                     ) { vm.refreshStatus(); vm.refreshFolders() }
                 }
             }
+            // "Save archive only": raw archive → My Files (Contents save location), nothing installed.
+            // Already saved → dimmed, tap explains, long-press re-downloads. Available on every row
+            // (installed ones too — the archive is still worth keeping) across all repos and drivers.
+            SaveArchiveAction(
+                saved = saved, enabled = !busy,
+                onClick = {
+                    if (saved) {
+                        Toast.makeText(context, "Already saved to $baseDisplay${item.type}/. Long-press to re-download.", Toast.LENGTH_SHORT).show()
+                    } else vm.saveArchive(item)
+                },
+                onLongClick = { vm.saveArchive(item, force = true) },
+            )
         }
+    }
+}
+
+@OptIn(ExperimentalFoundationApi::class)
+@Composable
+private fun SaveArchiveAction(saved: Boolean, enabled: Boolean, onClick: () -> Unit, onLongClick: () -> Unit) {
+    val cs = MaterialTheme.colorScheme
+    Box(
+        contentAlignment = Alignment.Center,
+        modifier = Modifier
+            .fillMaxHeight()
+            .width(46.dp)
+            .border(1.dp, if (saved) SavedBlue.copy(alpha = 0.5f) else cs.outline, RoundedCornerShape(11.dp))
+            .background(if (saved) SavedBlue.copy(alpha = 0.10f) else cs.onSurface.copy(alpha = 0.04f), RoundedCornerShape(11.dp))
+            .then(if (enabled) Modifier.combinedClickable(
+                onClickLabel = "Save archive only",
+                onLongClickLabel = "Re-download archive",
+                onClick = onClick, onLongClick = onLongClick,
+            ) else Modifier)
+            .alpha(if (!enabled) 0.4f else if (saved) 0.6f else 1f),
+    ) {
+        Icon(Icons.Filled.Save, "Save archive only", tint = if (saved) SavedBlue else cs.onSurface, modifier = Modifier.size(18.dp))
     }
 }
 
@@ -692,7 +754,7 @@ private fun MyFilesTab(vm: ContentsHubViewModel) {
 
         if (folders.isEmpty()) {
             Box(Modifier.weight(1f).fillMaxWidth(), contentAlignment = Alignment.Center) {
-                Text("No saved archives yet.\nEnable “Keep raw archive” before downloading.",
+                Text("No saved archives yet.\nUse the disk icon on a component to save its archive here, or enable “Keep raw archive” before installing.",
                     color = cs.onSurfaceVariant, style = MaterialTheme.typography.bodySmall)
             }
         } else {
@@ -744,10 +806,20 @@ private fun FolderCard(
                     Column(modifier = Modifier.weight(1f)) {
                         Text(f.name, style = MaterialTheme.typography.bodySmall, color = cs.onSurface,
                             maxLines = 1, overflow = TextOverflow.Ellipsis, fontWeight = FontWeight.SemiBold)
-                        Text(RemoteSourceRepository.formatFileSize(f.sizeBytes), style = MaterialTheme.typography.labelSmall, color = cs.onSurfaceVariant)
+                        // Only the library can tell a save-only archive from one kept on install.
+                        Text(
+                            if (f.savedOnly) "${RemoteSourceRepository.formatFileSize(f.sizeBytes)} · saved only, not installed"
+                            else RemoteSourceRepository.formatFileSize(f.sizeBytes),
+                            style = MaterialTheme.typography.labelSmall,
+                            color = if (f.savedOnly) SavedBlue else cs.onSurfaceVariant,
+                            maxLines = 1, overflow = TextOverflow.Ellipsis,
+                        )
                     }
                     IconButton(onClick = {
-                        ContentsInstaller.installFromFile(context.applicationContext, f.type, f.name, f.uri) { vm.refreshStatus() }
+                        // Reinstall = the normal offline install; on success the file stops being "saved only".
+                        ContentsInstaller.installFromFile(context.applicationContext, f.type, f.name, f.uri) { ok ->
+                            if (ok) vm.markInstalledFromSaved(f) else vm.refreshStatus()
+                        }
                     }) { Icon(Icons.Filled.InstallDesktop, "Install", tint = cs.primary) }
                     IconButton(onClick = { shareArchive(context, f) }) { Icon(Icons.Filled.Share, "Share", tint = cs.onSurfaceVariant) }
                     IconButton(onClick = { vm.deleteSaved(f) }) { Icon(Icons.Filled.DeleteOutline, "Delete", tint = cs.onSurfaceVariant) }
@@ -1135,17 +1207,19 @@ private fun ImportExportDialog(vm: ContentsHubViewModel, onDismiss: () -> Unit) 
 private fun SettingsDialog(vm: ContentsHubViewModel, onDismiss: () -> Unit, onLocation: () -> Unit) {
     val cs = MaterialTheme.colorScheme
     val keepRaw by vm.keepRaw.collectAsState()
+    val showOfficial by vm.showOfficial.collectAsState()
     val baseDisplay by vm.baseDisplay.collectAsState()
     OutlinedAlertDialog(
         onDismissRequest = onDismiss,
         containerColor = cs.surfaceContainerHigh,
         title = { Text("Contents settings", color = cs.onSurface) },
         text = {
-            Column {
+            // Scrolls so the taller body still fits a landscape phone (dialog height is capped there).
+            Column(modifier = Modifier.verticalScroll(rememberScrollState())) {
                 Row(verticalAlignment = Alignment.CenterVertically, modifier = Modifier.fillMaxWidth().padding(vertical = 6.dp)) {
                     Column(modifier = Modifier.weight(1f)) {
                         Text("Keep raw archive by default", style = MaterialTheme.typography.bodyMedium, color = cs.onSurface)
-                        Text("Save every download to My Files", style = MaterialTheme.typography.bodySmall, color = cs.onSurfaceVariant)
+                        Text("Save every install's download to My Files", style = MaterialTheme.typography.bodySmall, color = cs.onSurfaceVariant)
                     }
                     Switch(checked = keepRaw, onCheckedChange = { vm.setKeepRaw(it) },
                         colors = SwitchDefaults.colors(checkedThumbColor = Color.White, checkedTrackColor = cs.primary))
@@ -1154,6 +1228,18 @@ private fun SettingsDialog(vm: ContentsHubViewModel, onDismiss: () -> Unit, onLo
                 MenuRow(Icons.Filled.FolderSpecial, "Save location") { onLocation() }
                 Text(baseDisplay, style = MaterialTheme.typography.labelSmall, color = cs.onSurfaceVariant,
                     modifier = Modifier.padding(start = 36.dp))
+                Text("Save-only archives (the disk icon) are filed by type in this folder too.",
+                    style = MaterialTheme.typography.bodySmall, color = cs.onSurfaceVariant,
+                    modifier = Modifier.padding(start = 36.dp, top = 2.dp))
+                MenuItemDivider()
+                Row(verticalAlignment = Alignment.CenterVertically, modifier = Modifier.fillMaxWidth().padding(vertical = 6.dp)) {
+                    Column(modifier = Modifier.weight(1f)) {
+                        Text("Show Official catalog in repositories", style = MaterialTheme.typography.bodyMedium, color = cs.onSurface)
+                        Text("Off hides it here; container and shortcut sheets keep it", style = MaterialTheme.typography.bodySmall, color = cs.onSurfaceVariant)
+                    }
+                    Switch(checked = showOfficial, onCheckedChange = { vm.setShowOfficial(it) },
+                        colors = SwitchDefaults.colors(checkedThumbColor = Color.White, checkedTrackColor = cs.primary))
+                }
                 MenuItemDivider()
                 MenuRow(Icons.Filled.Restore, "Restore default repositories") { vm.restoreDefaultSources(); onDismiss() }
             }

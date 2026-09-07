@@ -70,6 +70,9 @@ data class ContentDownloadState(
     // True for catalog items (download THEN install → two-pass overlay bar); false for local-file
     // installs (install only → single pass). Drives the popup's progress bar rendering.
     val hasDownload: Boolean = false,
+    // Contents hub "Save archive only": the archive is downloaded and filed in My Files, nothing is
+    // installed. The popup/row relabel DONE as "Saved" (never "Installed") and INSTALLING as "Saving".
+    val saveOnly: Boolean = false,
 ) {
     val terminal: Boolean get() = phase == ContentDownloadPhase.DONE || phase == ContentDownloadPhase.ERROR
 }
