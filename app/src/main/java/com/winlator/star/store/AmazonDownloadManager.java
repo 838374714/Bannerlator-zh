@@ -361,7 +361,7 @@ public class AmazonDownloadManager {
         // Improvements round 1: the Rust path takes its in-flight ceiling from the Steam speed
         // tier (Fast = 32) instead of Java's MAX_PARALLEL; the adapter gives the whole ceiling
         // to Amazon's single CDN host. The Java loop below keeps its own 8 threads untouched.
-        DownloadSpeedConfig cfg = new DownloadSpeedConfig(DownloadSpeedConfig.DEFAULT_TIER);
+        DownloadSpeedConfig cfg = StoreDownloadTier.config(ctx);
         int maxWorkers = Math.max(1, Math.min(128, cfg.getMaxNetworkWindow()));
         int processWorkers = Math.max(
                 Math.max(1, Runtime.getRuntime().availableProcessors() / 2),

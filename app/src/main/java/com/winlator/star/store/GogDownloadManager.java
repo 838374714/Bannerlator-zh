@@ -1837,7 +1837,7 @@ public final class GogDownloadManager {
         int rustWorkers = maxWorkers;
         int rustProcess = Math.max(processWorkers, RUST_MIN_PROCESS_WORKERS);
         try {
-            DownloadSpeedConfig cfg = new DownloadSpeedConfig(DownloadSpeedConfig.DEFAULT_TIER);
+            DownloadSpeedConfig cfg = StoreDownloadTier.config(ctx);
             rustWorkers = Math.max(1, Math.min(128, cfg.getMaxNetworkWindow()));
             rustProcess = Math.max(rustProcess, Math.max(1, Math.min(32, cfg.getMaxDecompress())));
         } catch (Throwable t) {
