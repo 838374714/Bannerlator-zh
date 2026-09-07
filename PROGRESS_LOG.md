@@ -1,5 +1,8 @@
 # Star-Compose — Progress Log
 
+## 2026-09-06 — 🤖 **AMA bot answer-quality rewrite** (`4fac5c3f`, main) — shorter plain-language replies, never "I fixed it"
+> `.opencode/agent/ama-agent.md` rewritten (layman voice, 80-200 words, no tables/code dumps, ≤3 refs in a trailing `Checked:` line, verified-only claims, maintainer's-call wording, routing rules: per-game → community, Mali → board, VEGAS → isygold). `ama-answer.yml`: reply extracted after a `<<<ANSWER>>>` marker (narration-strip fallback), current versionName injected into the question. YAML + awk logic verified locally; ⏳ awaiting the next real issue to prove on.
+
 ## 2026-09-06 — 🗂️ **Issue-tracker triage: 28 → 6 open** (+ #471 VEGAS forensics, + binder mixed-mode finding)
 > Closed with short replies: game-specific → community (#477 #407 #465 #464 #467 #424 #425 #415 #478), Mali → report board (#453), VEGAS → isygold + Mali link (#471), chatter/no-info (#472 #434 #435 #459 #470 #427 #479), fixed (#410 → dc8e5fb6; #431 + #475 → `00ef3a07`, user-confirmed).
 > - **#471 device forensics (root bridge, pubg build):** VEGAS 1.11.1 Sarek install SUCCEEDED (`contents/VEGAS/vegas-1.11.1-60383b1-1783652018/` complete 22:25:28); the sheet has no Installed marker so a re-tap 11 s later re-downloaded, re-extracted, and hit `ERROR_EXIST` → generic "Install failed". Package itself verified good (same layout as 1.11.2). UX fix (installed checkmark + "already installed" wording) NOT built. Screenshots parked at `docs/issue-attachments/471/` (`d7db7f93`).
