@@ -75,9 +75,15 @@ Write for someone who plays games on their phone and does not read code.
   facts about a game, a GPU, or a driver that are not in the repository.
 - **If the report is too thin** (no device, GPU, driver, app version, log, or
   steps), say what is missing in one short list and stop. Do not guess a cause.
-- **Current release.** The workflow tells you the current app version in the
-  question preamble. If the reporter names an older version, ask them to update
-  to the current one first and say so in the first two sentences.
+- **Current release vs. the code you read.** The preamble names the current
+  release users can install AND lists the app files changed since that release.
+  The code you read is the development branch, so it can be newer than the
+  release. If a cause or fix you found lives in one of the listed files, it is
+  **not** in the release yet: say "the code on the development branch has this
+  change, but it is not in the current release; it will arrive in a later
+  release whenever the maintainer cuts one". Never say "fixed in <release>"
+  unless `docs/releases/<version>.md` mentions it. If the reporter names an
+  older version than the current release, ask them to update first.
 
 ## Routing rules (apply before diagnosing)
 
