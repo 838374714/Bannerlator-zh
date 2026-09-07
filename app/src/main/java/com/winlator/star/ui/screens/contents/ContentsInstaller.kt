@@ -2,7 +2,10 @@ package com.winlator.star.ui.screens.contents
 
 import android.content.Context
 import android.net.Uri
+import android.os.Handler
+import android.os.Looper
 import android.util.Log
+import android.widget.Toast
 import com.winlator.star.contents.AdrenotoolsManager
 import com.winlator.star.contents.ContentProfile
 import com.winlator.star.contents.ContentsManager
@@ -139,6 +142,104 @@ object ContentsInstaller {
             }
         }
         ContentDownloadRegistry.attachJob(key, job)
+    }
+
+    /**
+     * "Save archive only": downloads the catalog item and files the raw archive in [ComponentLibrary]
+     * (My Files, under the Contents save location) — no extract, no install, the app's contents folder
+     * is untouched. Deliberately rides the SAME rails as [install]: same registry key (so a row is
+     * either installing or saving, never both), the same [DownloadForegroundService] bracket and
+     * shade line, the same popup and Cancel path. The state carries [ContentDownloadState.saveOnly]
+     * so the row/popup read "Saving" / "Saved" instead of "Installing" / "Installed".
+     *
+     * Works for every repository and for GPU drivers alike (a driver .zip is filed under
+     * `components/GPU Drivers/`, exactly where a keep-raw install would have put it). The outcome is
+     * toasted from the main thread; [onChanged] runs after a successful save so badges/My Files refresh.
+     */
+    fun saveOnly(
+        appContext: Context,
+        type: String,
+        sourceName: String,
+        versionName: String,
+        downloadUrl: String,
+        onChanged: () -> Unit = {},
+    ) {
+        val ctx = appContext.applicationContext
+        val key = keyFor(type, sourceName, versionName)
+        ContentDownloadRegistry.get(key)?.let { if (!it.terminal) return }
+
+        val fileName = downloadUrl.substringAfterLast('/').substringBefore('?')
+            .ifBlank { "${versionName.replace(Regex("[^A-Za-z0-9._-]"), "_")}.wcp" }
+
+        ContentDownloadRegistry.put(
+            ContentDownloadState(
+                key = key,
+                title = versionName,
+                type = type,
+                verName = versionName,
+                phase = ContentDownloadPhase.DOWNLOADING,
+                fraction = 0f,
+                hasDownload = true,
+                saveOnly = true,
+            ),
+        )
+        DownloadForegroundService.start(ctx)
+        DownloadForegroundService.setProgress(key, "$versionName — Downloading 0%")
+
+        val job = DownloadScope.io.launch {
+            val repo = RemoteSourceRepository(ctx)
+            val library = ComponentLibrary(ctx)
+            var temp: File? = null
+            var ok = false
+            try {
+                temp = repo.downloadToTemp(downloadUrl) { msg ->
+                    val pct = Regex("(\\d+)%").find(msg)?.groupValues?.getOrNull(1)?.toIntOrNull()
+                    ContentDownloadRegistry.update(key) {
+                        it.copy(phase = ContentDownloadPhase.DOWNLOADING, fraction = (pct ?: 0) / 100f)
+                    }
+                    DownloadForegroundService.setProgress(key, "$versionName — $msg")
+                }
+
+                // ── File phase (moved into place when possible; a copy otherwise) ──
+                ContentDownloadRegistry.update(key) {
+                    it.copy(phase = ContentDownloadPhase.INSTALLING, fraction = 0f)
+                }
+                DownloadForegroundService.setProgress(key, "$versionName — Saving to My Files")
+                ok = library.saveRaw(type, fileName, temp!!, saveOnly = true)
+
+                ContentDownloadRegistry.update(key) {
+                    if (ok) it.copy(phase = ContentDownloadPhase.DONE, fraction = 1f)
+                    else it.copy(phase = ContentDownloadPhase.ERROR, error = "Save failed.")
+                }
+                if (ok) runCatching { onChanged() }
+                toast(ctx, if (ok) "Saved to ${library.baseDisplay()}$type/$fileName — see My Files"
+                           else "Save failed — $versionName")
+            } catch (c: CancellationException) {
+                throw c // user Cancel — requestCancel already set the cancelled-terminal state; keep it.
+            } catch (e: Exception) {
+                Log.w(TAG, "save-only failed for $key", e)
+                ContentDownloadRegistry.update(key) {
+                    it.copy(phase = ContentDownloadPhase.ERROR, error = "Save failed.")
+                }
+                toast(ctx, "Save failed — $versionName")
+            } finally {
+                // A moved temp no longer exists; a copied/cancelled/failed one is cleaned up here.
+                temp?.let { runCatching { if (it.exists()) it.delete() } }
+                DownloadForegroundService.finish(key)
+                ContentDownloadRegistry.clearJob(key)
+                val st = ContentDownloadRegistry.get(key)
+                val linger = if (st?.phase == ContentDownloadPhase.ERROR && !st.cancelled) 60_000L else 2_000L
+                withContext(NonCancellable) {
+                    delay(linger)
+                    if (ContentDownloadRegistry.get(key)?.terminal == true) ContentDownloadRegistry.remove(key)
+                }
+            }
+        }
+        ContentDownloadRegistry.attachJob(key, job)
+    }
+
+    private fun toast(ctx: Context, text: String) {
+        Handler(Looper.getMainLooper()).post { runCatching { Toast.makeText(ctx, text, Toast.LENGTH_LONG).show() } }
     }
 
     /** Installs an already-local archive (My Files "install offline" / install-from-file). */

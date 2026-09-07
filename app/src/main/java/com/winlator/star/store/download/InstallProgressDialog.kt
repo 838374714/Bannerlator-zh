@@ -105,9 +105,10 @@ fun InstallProgressDialog(
                 val frac = state.fraction.coerceIn(0f, 1f)
                 val label = when {
                     state.cancelled -> "Cancelled"
-                    state.phase == ContentDownloadPhase.ERROR -> state.error ?: "Install failed."
-                    state.phase == ContentDownloadPhase.DONE -> "Installed"
+                    state.phase == ContentDownloadPhase.ERROR -> state.error ?: if (state.saveOnly) "Save failed." else "Install failed."
+                    state.phase == ContentDownloadPhase.DONE -> if (state.saveOnly) "Saved to My Files" else "Installed"
                     state.phase == ContentDownloadPhase.DOWNLOADING -> "Downloading ${(frac * 100).toInt()}%"
+                    state.saveOnly -> "Saving to My Files"
                     else -> "Installing ${(frac * 100).toInt()}%"
                 }
                 // Cancelled reads as a neutral outcome (not the alarming error red); a finished install

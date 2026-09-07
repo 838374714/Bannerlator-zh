@@ -2,8 +2,10 @@ package com.winlator.star.ui.screens.contents
 
 import android.content.Context
 import android.content.SharedPreferences
+import com.winlator.star.contents.ContentsManager
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.coroutineScope
+import kotlinx.coroutines.ensureActive
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import org.json.JSONArray
@@ -50,6 +52,14 @@ class RemoteSourceRepository(private val context: Context) {
 
         const val GPU_DRIVER_TYPE = "GPU Drivers"
         val GPU_DRIVER_KEYWORDS = listOf("turnip", "adreno", "qualcomm", "mesa")
+
+        /** Display name of the built-in Official catalog source (ContentsManager.REMOTE_PROFILES). */
+        const val OFFICIAL_SOURCE_NAME = "Official"
+        private const val KEY_SHOW_OFFICIAL = "show_official"
+
+        /** URL identity used to dedupe a user-added copy of a built-in source (scheme/case/trailing-slash tolerant). */
+        private fun urlKey(url: String): String = url.trim().trimEnd('/').lowercase()
+            .removePrefix("https://").removePrefix("http://")
 
         /** True when [componentType] is the GPU-driver category or one of its keyword aliases. */
         private fun isDriverType(componentType: String): Boolean =
@@ -245,7 +255,10 @@ class RemoteSourceRepository(private val context: Context) {
         // Extra endpoints for composite sources — each endpoint owns a subset of types
         val extraEndpoints: List<ExtraEndpoint> = emptyList(),
         // Individual GitHub release names the user opted in to browse as their own categories
-        val releaseTags: List<String> = emptyList()
+        val releaseTags: List<String> = emptyList(),
+        // True only for the built-in Official catalog (contents.json) — drives the green Official badge in
+        // the hub and keeps the container/shortcut sheet from listing it a second time as "community".
+        val isOfficial: Boolean = false,
     )
 
     data class RepoListImport(
@@ -269,12 +282,26 @@ class RemoteSourceRepository(private val context: Context) {
     // exclusively from the shared adrenotools registry (DriverSources / DriverSourceStore), so a
     // driver source is never double-listed and edits to it apply to both the Contents and
     // AdrenoTools screens.
+    //
+    // The Official catalog (the same contents.json the container/shortcut Compatibility Layer sheet
+    // shows as its "Official" group) is listed FIRST so components can be fetched — or just saved —
+    // outside a game's settings. It can be hidden like any default (menu → Hide, or the Contents
+    // settings toggle); the sheet keeps it regardless.
     private val defaultSources = listOf(
+        RemoteSource(
+            name = OFFICIAL_SOURCE_NAME,
+            url = ContentsManager.REMOTE_PROFILES,
+            format = SourceFormat.WCP_JSON,
+            supportedTypes = listOf("DXVK", "D7VK", "VKD3D", "Box64", "WOWBox64", "FEXCore", "Wine", "Proton"),
+            isOfficial = true,
+        ),
         RemoteSource(
             name = "StevenMXZ",
             url = "https://raw.githubusercontent.com/StevenMXZ/Winlator-Contents/main/contents.json",
             format = SourceFormat.WCP_JSON,
-            supportedTypes = listOf("dxvk", "vkd3d", "box64", "fex", "fexcore", "wine", "proton")
+            // wowbox64 listed explicitly: the catalog types its WOWBox64 packs as such and the parser
+            // now matches on that field, so they no longer ride along under the box64 chip.
+            supportedTypes = listOf("dxvk", "vkd3d", "box64", "wowbox64", "fex", "fexcore", "wine", "proton")
         ),
         RemoteSource(
             name = "Arihany WCPHub",
@@ -285,10 +312,18 @@ class RemoteSourceRepository(private val context: Context) {
         RemoteSource("Nightlies by The412Banner", "https://raw.githubusercontent.com/The412Banner/Nightlies/refs/heads/main/nightlies_components.json", SourceFormat.PACK_JSON, listOf("DXVK", "D7VK", "VKD3D", "FEXCore", "Box64", "WOWBox64")),
     )
 
+    /** Contents-settings toggle: list the Official catalog among the hub's repositories (default ON). */
+    fun showOfficial(): Boolean = prefs.getBoolean(KEY_SHOW_OFFICIAL, true)
+    fun setShowOfficial(value: Boolean) = prefs.edit().putBoolean(KEY_SHOW_OFFICIAL, value).apply()
+
     fun getAllSources(): List<RemoteSource> {
         val removedDefaults = getRemovedDefaultSources()
-        val filteredDefaults = defaultSources.filter { it.name !in removedDefaults }
-        val all = filteredDefaults + getCustomSources()
+        val showOfficial = showOfficial()
+        val filteredDefaults = defaultSources.filter { it.name !in removedDefaults && (showOfficial || !it.isOfficial) }
+        // A custom source pointing at a visible built-in's URL (e.g. the user pasted contents.json before
+        // Official was built in) would list the same catalog twice — the built-in wins while it's shown.
+        val defaultUrls = filteredDefaults.map { urlKey(it.url) }.toSet()
+        val all = filteredDefaults + getCustomSources().filter { urlKey(it.url) !in defaultUrls }
         val order = getSourceOrder()
         if (order.isEmpty()) return all
         val orderMap = order.withIndex().associate { (i, name) -> name to i }
@@ -403,7 +438,7 @@ class RemoteSourceRepository(private val context: Context) {
     }
 
     fun restoreDefaultSources() {
-        prefs.edit().remove("removed_defaults").remove("source_order").apply()
+        prefs.edit().remove("removed_defaults").remove("source_order").remove(KEY_SHOW_OFFICIAL).apply()
     }
 
     fun exportRepoListJson(): String {
@@ -736,25 +771,7 @@ class RemoteSourceRepository(private val context: Context) {
         sourceName: String
     ): List<RemoteItem> = withContext(Dispatchers.IO) {
         val json = openUrl(jsonUrl).inputStream.bufferedReader().readText()
-        val array = JSONArray(json)
-        val all = mutableListOf<RemoteItem>()
-        for (i in 0 until array.length()) {
-            val obj = array.getJSONObject(i)
-            val type = obj.getString("type")
-            val verName = obj.getString("verName")
-            val url = obj.getString("remoteUrl")
-            all.add(RemoteItem(displayName = "$type  $verName", versionName = verName, downloadUrl = url, sourceName = sourceName))
-        }
-        // Ensure we only return items strictly matching the requested component folder
-        val filtered = when {
-            componentType == GPU_DRIVER_TYPE ->
-                all.filter { item -> GPU_DRIVER_KEYWORDS.any { kw -> item.displayName.contains(kw, ignoreCase = true) } }
-            componentType.equals("fex", ignoreCase = true) ->
-                all.filter { it.displayName.contains("fex", ignoreCase = true) }
-            else ->
-                all.filter { it.displayName.contains(componentType, ignoreCase = true) }
-        }
-        filtered.reversed()
+        WcpJsonCatalog.parse(json, componentType, sourceName)
     }
 
     private suspend fun fetchTurnipReleases(url: String, sourceName: String, filterKeyword: String = ""): List<RemoteItem> = withContext(Dispatchers.IO) {
@@ -1326,6 +1343,9 @@ class RemoteSourceRepository(private val context: Context) {
                 val buffer = ByteArray(16384)
                 var bytes: Int
                 while (input.read(buffer).also { bytes = it } != -1) {
+                    // A user Cancel (ContentDownloadRegistry.requestCancel) cancels the job; without this
+                    // check the blocking read loop would only notice at the end of the transfer.
+                    ensureActive()
                     output.write(buffer, 0, bytes)
                     downloaded += bytes
                     val msg = if (total > 0) {

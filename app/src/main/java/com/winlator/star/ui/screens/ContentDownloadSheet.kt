@@ -170,7 +170,9 @@ fun ContentDownloadSheet(
         val groups = withContext(Dispatchers.IO) {
             val repo = RemoteSourceRepository(context)
             repo.getAllSources()
-                .filter { sourceSupportsType(it, typeStr) }
+                // The hub lists the Official catalog as a built-in repository; this sheet already renders
+                // that same contents.json as its own Official group, so skip it here (never "community").
+                .filter { !it.isOfficial && sourceSupportsType(it, typeStr) }
                 .mapNotNull { s ->
                     val items = runCatching { repo.fetchFromSource(s, typeStr) }.getOrDefault(emptyList())
                         .map { it.toProfile(selectedType) }
@@ -779,7 +781,9 @@ private const val COMMUNITY_PREFS = "component_download_prefs"
 private const val COMMUNITY_KEY = "include_community"
 private const val OFFICIAL_KEY = "__official__"
 
-private val OfficialColor = Color(0xFF37C26B)
+/** Official-source green, shared with the Contents hub's repository badge. */
+internal val OfficialSourceColor = Color(0xFF37C26B)
+private val OfficialColor = OfficialSourceColor
 private val CommunityPalette = listOf(
     Color(0xFF3D9BFF), Color(0xFFB98CFF), Color(0xFFFF7A18),
     Color(0xFF4DD0E1), Color(0xFFFFB300), Color(0xFF66BB6A),
@@ -906,15 +910,21 @@ private fun SourceGroupHeader(section: SheetSection) {
         Spacer(Modifier.width(9.dp))
         Text(section.label, style = MaterialTheme.typography.labelLarge, color = cs.onSurface, fontWeight = FontWeight.Bold)
         Spacer(Modifier.width(8.dp))
-        Text(
-            if (section.community) "Community" else "Official",
-            style = MaterialTheme.typography.labelSmall, fontWeight = FontWeight.Bold, color = section.color,
-            modifier = Modifier.clip(RoundedCornerShape(20.dp)).background(section.color.copy(alpha = 0.14f))
-                .padding(horizontal = 8.dp, vertical = 2.dp),
-        )
+        SourceTagBadge(if (section.community) "Community" else "Official", section.color)
         Spacer(Modifier.weight(1f))
         Text("${section.rows.size}", style = MaterialTheme.typography.labelSmall, color = cs.onSurfaceVariant)
     }
+}
+
+/** The "Official" / "Community" tag pill — one look for the sheet's group headers and the hub's repo rows. */
+@Composable
+internal fun SourceTagBadge(label: String, color: Color) {
+    Text(
+        label,
+        style = MaterialTheme.typography.labelSmall, fontWeight = FontWeight.Bold, color = color, maxLines = 1,
+        modifier = Modifier.clip(RoundedCornerShape(20.dp)).background(color.copy(alpha = 0.14f))
+            .padding(horizontal = 8.dp, vertical = 2.dp),
+    )
 }
 
 @Composable
