@@ -1,6 +1,6 @@
 # Container Layer Update (in-place Proton/Wine swap) + "layer update available" badge — Plan
 
-**Branch:** `feat/container-layer-update` (off `main` `c0dd2ee5`) · **Status:** recon only, no app code touched.
+**Branch:** `feat/container-layer-update-impl` (off `main` `c0dd2ee5`) · **Status:** r1 implemented (installed-only detection, C1 steps 1-5 + revert; no catalog tiers, no cross-line, no `.update-timestamp` removal — Wine handles that on first launch).
 
 **Goal:** a container created on `Proton-11.0-6-arm64ec-4` can be moved to the installed `…-5` layer
 in place (prefix, games, registry, saves kept), with a revert path; and the container list tells the
