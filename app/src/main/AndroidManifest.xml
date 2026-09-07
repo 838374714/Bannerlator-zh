@@ -166,6 +166,12 @@
             android:theme="@style/AppTheme"/>
         <activity
             android:exported="false"
+            android:name="com.winlator.star.store.MediaVideoActivity"
+            android:screenOrientation="sensor"
+            android:configChanges="keyboard|keyboardHidden|orientation|screenSize|screenLayout|smallestScreenSize|density|navigation"
+            android:theme="@style/AppTheme"/>
+        <activity
+            android:exported="false"
             android:name="com.winlator.star.store.StoreWebActivity"
             android:screenOrientation="sensor"
             android:configChanges="keyboard|keyboardHidden|orientation|screenSize|screenLayout|smallestScreenSize|density|navigation"
