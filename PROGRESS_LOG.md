@@ -1,5 +1,10 @@
 # Star-Compose — Progress Log
 
+## 2026-09-07 — ✅ **Store download speed tier MERGED `64bf48a2`** + day summary (all four 09-07 features on main)
+> `StoreDownloadTier` (pref `store_dl_speed_tier`, Log Manager row "Store download speed", Slow/Medium/Fast/Blazing = 6/16/32/96 in flight, default Fast) feeds the Rust Epic/GOG/Amazon engines; Java fallbacks unchanged. Device: Blazing on Quake II RTX (1.2 GB) 22.4 s vs Fast 21.1 s — GOG's CDN is the limit (~50 MB/s per host), so Fast stays default; Java took ~80 s on the same title.
+> - On main today, each a single revertable merge: `efebe90a` Rust store engines · `1987972a` Contents hub Official repo + save-only · `63af72ab` Media tab (4 stores) · `64bf48a2` speed tier. Verification build `main-all-20260907` run 34145256632.
+> - Open before a release: cancel/resume on the Rust store paths; device pass on the Contents hub and the Steam/Epic/Amazon Media tabs (Amazon needs a library refresh first).
+
 ## 2026-09-07 — ✅ **Rust store download engines MERGED to main `efebe90a`** (revert `git revert -m 1 efebe90a`) — Epic / GOG / Amazon on the shared adaptive fetch core
 > Merge of `feat/rust-dl-all` (29 files, engine work only, file list verified). Device-proven vs the Java managers on the same titles: GOG 4.5 s → 2.2 s, Epic 11.4 s → 4.3 s, Amazon 68 s → 48 s. Flags `use_rust_{epic,gog,amazon}_engine` default ON in Log Manager; Java paths untouched as fallback. Docs: `docs/RUST_STORE_ENGINES.md`, `docs/RUST_{EPIC,GOG,AMAZON}_PARITY.md`. Next off main: Contents hub Official repo + save-only (`feat/contents-official-saveonly`), store Media tab (`feat/store-media-tab`, `-amazon-epic`).
 ## 2026-09-07 — 🖼️🎬 **Store "Media" tab — shared UI + Steam + GOG** (branch `feat/store-media-tab` off main `efebe90a`; Amazon + Epic on `feat/store-media-tab-amazon-epic`)
