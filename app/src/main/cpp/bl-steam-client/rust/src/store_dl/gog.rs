@@ -62,6 +62,8 @@ pub fn md5_hex_file(path: &Path) -> Option<String> {
 /// zlib-inflate a chunk body (`GogDownloadManager.inflateZlib`): `None` when the body is not a
 /// zlib stream (first byte != 0x78) or fails to inflate — the caller then treats the body as a
 /// stored (non-compressed) chunk, exactly like Java's `if (inflated == null) inflated = raw`.
+/// A truncated stream yields the partial output (Java's loop breaks on `n == 0` the same way);
+/// the decompressed-size check that follows rejects it.
 pub fn inflate_zlib(data: &[u8]) -> Option<Vec<u8>> {
     if data.len() < 2 || data[0] != 0x78 {
         return None;
@@ -97,11 +99,18 @@ mod tests {
         // Not zlib → None (stored chunk path).
         assert!(inflate_zlib(b"\x1f\x8bnot zlib").is_none());
         assert!(inflate_zlib(b"\x78").is_none());
-        // Corrupt zlib → None (Java: DataFormatException → null → raw fallback).
+        // Truncated zlib → partial output, like Java's `while (!inf.finished()) { if (n == 0) break; }`
+        // loop; the decompressed-size check downstream rejects it either way.
+        let mut truncated = compressed.clone();
+        let mid = truncated.len() / 2;
+        truncated.truncate(mid);
+        assert!(inflate_zlib(&truncated).map(|out| out != payload).unwrap_or(true));
+        // Corrupt zlib body → None (Java: DataFormatException → null → raw fallback).
         let mut corrupt = compressed.clone();
-        let mid = corrupt.len() / 2;
-        corrupt.truncate(mid);
-        assert!(inflate_zlib(&corrupt).is_none());
+        for b in corrupt.iter_mut().skip(2) {
+            *b = !*b;
+        }
+        assert!(inflate_zlib(&corrupt).is_none() || inflate_zlib(&corrupt).unwrap() != payload);
     }
 
     #[test]

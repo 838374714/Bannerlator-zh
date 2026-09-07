@@ -1169,7 +1169,7 @@ mod tests {
         assert_eq!(res.files_verified, 1);
         assert_eq!(res.bytes_written, 0, "verified files credit no bytes (Java totalBytes)");
         let events = rec.events.lock().unwrap();
-        assert!(events[0].starts_with("log engine=rust label=test files=2 chunks=2"), "{:?}", events[0]);
+        assert!(events[0].starts_with("log engine=rust kind=gen2 label=test files=2 chunks=2"), "{:?}", events[0]);
         assert!(events.iter().any(|e| e == "done a.bin bytes=12 verified=true 1/2 total=0"), "{events:?}");
         assert!(!events.iter().any(|e| e.contains("skipped.bin")), "{events:?}");
         let _ = fs::remove_dir_all(&dir);
