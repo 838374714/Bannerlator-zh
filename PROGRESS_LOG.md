@@ -1,5 +1,8 @@
 # Star-Compose — Progress Log
 
+## 2026-09-07 — ✅ **EA setup legacy-shortcut fix MERGED** (`fix/ea-setup-legacy-shortcut` `7d103812`, CI run 34084437433) — NFS Heat "couldn't locate the game's install folder"
+> `EaSupport.resolveSteamAppId`: shortcuts written before the `steamAppId` tag existed are matched against the installed-games DB (same folder, then folder name) or the folder's `steam_appid.txt`, and the id is stamped back onto the shortcut. `ShortcutsScreen` EA setup now derives the install dir the same way the dialog gate does and reports which of exe/app id failed. Additive; the EA-on-Steam desktop flow is untouched.
+
 ## 2026-09-07 — ✅ **Store download speed tier MERGED `64bf48a2`** + day summary (all four 09-07 features on main)
 > `StoreDownloadTier` (pref `store_dl_speed_tier`, Log Manager row "Store download speed", Slow/Medium/Fast/Blazing = 6/16/32/96 in flight, default Fast) feeds the Rust Epic/GOG/Amazon engines; Java fallbacks unchanged. Device: Blazing on Quake II RTX (1.2 GB) 22.4 s vs Fast 21.1 s — GOG's CDN is the limit (~50 MB/s per host), so Fast stays default; Java took ~80 s on the same title.
 > - On main today, each a single revertable merge: `efebe90a` Rust store engines · `1987972a` Contents hub Official repo + save-only · `63af72ab` Media tab (4 stores) · `64bf48a2` speed tier. Verification build `main-all-20260907` run 34145256632.
