@@ -1,5 +1,8 @@
 # Star-Compose — Progress Log
 
+## 2026-09-07 — ✅ **AMA bot rewrite PROVEN on test issue #480** (`71675836`), + concurrency bug fixed (`c57e335d`)
+> First live run had the right shape but called a main-only fix "in 3.0.7"; the workflow now fetches the release tag and hands the bot the files changed since it, and the prompt forbids "fixed in <release>" for those. Second run: accurate, ~200 words, plain language, verified refs. Also found+fixed: issues created WITH a label fired opened+labeled a second apart and the shared concurrency group cancelled the real run (silent no-answer) → group keyed per event, queue instead of cancel. #480 closed.
+
 ## 2026-09-06 — 🤖 **AMA bot answer-quality rewrite** (`4fac5c3f`, main) — shorter plain-language replies, never "I fixed it"
 > `.opencode/agent/ama-agent.md` rewritten (layman voice, 80-200 words, no tables/code dumps, ≤3 refs in a trailing `Checked:` line, verified-only claims, maintainer's-call wording, routing rules: per-game → community, Mali → board, VEGAS → isygold). `ama-answer.yml`: reply extracted after a `<<<ANSWER>>>` marker (narration-strip fallback), current versionName injected into the question. YAML + awk logic verified locally; ⏳ awaiting the next real issue to prove on.
 
