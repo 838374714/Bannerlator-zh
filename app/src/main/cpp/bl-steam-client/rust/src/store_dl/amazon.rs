@@ -164,6 +164,15 @@ pub fn host_key(url: &str) -> String {
     format!("{scheme}://{}", &rest[..end])
 }
 
+/// Improvements round 1: `max(6, ceil(max_workers / distinct_hosts))` — a single-host store
+/// (Amazon's one signed a2z base) gets the whole ceiling on its one host; the core clamps the
+/// window to `hosts × per_host_cap`, so anything smaller would silently cut the ceiling.
+pub fn per_host_cap_for(max_workers: usize, distinct_hosts: usize) -> usize {
+    let hosts = distinct_hosts.max(1);
+    let per_host = max_workers.max(1).div_ceil(hosts);
+    per_host.max(crate::depot_writer::PER_HOST_CAP)
+}
+
 /// The resolved work for one run.
 #[derive(Debug, Default)]
 pub struct Plan {
@@ -536,8 +545,9 @@ pub fn run_download(
     let plan = build_plan(entries, install_dir);
     let files_total = plan.entries.len() as u64;
     let fetch_bytes: u64 = plan.items.iter().map(|item| item.reserve).sum();
+    let per_host_cap = per_host_cap_for(max_workers, plan.hosts.len());
     log(&format!(
-        "engine=rust mode=stream plan={} files skip={} ({} bytes) fetch={} ({} bytes) hosts={} workers={} process={} dir={}",
+        "engine=rust mode=stream plan={} files skip={} ({} bytes) fetch={} ({} bytes) hosts={} workers={} per_host_cap={} process={} dir={}",
         files_total,
         plan.skipped_files,
         plan.skipped_bytes,
@@ -545,6 +555,7 @@ pub fn run_download(
         fetch_bytes,
         plan.hosts.len(),
         max_workers,
+        per_host_cap,
         process_workers,
         install_dir
     ));
@@ -570,9 +581,9 @@ pub fn run_download(
 
     let opts = FetchOptions {
         max_workers,
-        // Every Amazon file comes from the one signed CDN base: the per-host cap must equal
-        // the window or the core would clamp 8 workers down to hosts × cap.
-        per_host_cap: max_workers,
+        // Every Amazon file comes from the one signed CDN base: give that host the whole
+        // ceiling (`per_host_cap_for`), or the core would clamp the window to hosts × cap.
+        per_host_cap,
         timeout: REQUEST_TIMEOUT,
         headers: vec![("User-Agent".to_string(), DOWNLOAD_USER_AGENT.to_string())],
         ca_bundle_path: ca_bundle_path.to_string(),
@@ -706,6 +717,15 @@ mod tests {
         assert_eq!(hex_decode("00FF"), Some(vec![0x00, 0xff]));
         assert_eq!(hex_decode("0"), None);
         assert_eq!(hex_decode("0g"), None);
+    }
+
+    #[test]
+    fn per_host_cap_gives_single_host_the_whole_ceiling() {
+        assert_eq!(per_host_cap_for(32, 1), 32);
+        assert_eq!(per_host_cap_for(32, 3), 11);
+        assert_eq!(per_host_cap_for(8, 1), 8);
+        assert_eq!(per_host_cap_for(4, 1), 6);
+        assert_eq!(per_host_cap_for(0, 0), 6);
     }
 
     #[test]
