@@ -4,11 +4,17 @@ import android.app.Application
 import android.content.Context
 import android.os.Environment
 import androidx.lifecycle.AndroidViewModel
+import androidx.lifecycle.viewModelScope
 import com.winlator.star.container.Container
+import com.winlator.star.container.ContainerLayerUpdater
 import com.winlator.star.container.ContainerManager
 import com.winlator.star.container.Shortcut
+import com.winlator.star.contents.ContentsManager
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
 import java.io.File
 
 class ContainersViewModel(app: Application) : AndroidViewModel(app) {
@@ -23,7 +29,21 @@ class ContainersViewModel(app: Application) : AndroidViewModel(app) {
     private val _message = MutableStateFlow<String?>(null)
     val message: StateFlow<String?> = _message
 
+    // Per-container in-place layer update state (see ContainerLayerUpdater). layerUpdates maps a
+    // container id to the entry name of a newer INSTALLED build of its layer line; layerSnapshots
+    // to the snapshot a previous update left behind (= "Revert" is possible).
+    private val _layerUpdates = MutableStateFlow<Map<Int, String>>(emptyMap())
+    val layerUpdates: StateFlow<Map<Int, String>> = _layerUpdates
+
+    private val _layerSnapshots = MutableStateFlow<Map<Int, ContainerLayerUpdater.Snapshot>>(emptyMap())
+    val layerSnapshots: StateFlow<Map<Int, ContainerLayerUpdater.Snapshot>> = _layerSnapshots
+
+    // Blocking progress text while an update/revert runs (null = idle).
+    private val _layerBusy = MutableStateFlow<String?>(null)
+    val layerBusy: StateFlow<String?> = _layerBusy
+
     private var manager: ContainerManager = ContainerManager(app)
+    private val layerUpdater = ContainerLayerUpdater(app)
 
     init {
         refresh()
@@ -31,7 +51,51 @@ class ContainersViewModel(app: Application) : AndroidViewModel(app) {
 
     fun refresh() {
         manager = ContainerManager(getApplication())
-        _containers.value = manager.getContainers().toList()
+        val list = manager.getContainers().toList()
+        _containers.value = list
+        scanLayerUpdates(list)
+    }
+
+    // Cheap directory scan (installed layers only, no network) off the main thread.
+    private fun scanLayerUpdates(list: List<Container>) {
+        viewModelScope.launch(Dispatchers.IO) {
+            val contents = ContentsManager(getApplication()).apply { syncContents() }
+            val updates = HashMap<Int, String>()
+            val snapshots = HashMap<Int, ContainerLayerUpdater.Snapshot>()
+            for (c in list) {
+                layerUpdater.findNewerInstalled(contents, c)?.let { updates[c.id] = it }
+                layerUpdater.latestSnapshot(c)
+                    ?.takeIf { it.oldEntry != c.wineVersion }
+                    ?.let { snapshots[c.id] = it }
+            }
+            _layerUpdates.value = updates
+            _layerSnapshots.value = snapshots
+        }
+    }
+
+    fun updateLayer(container: Container, targetEntry: String) {
+        runLayerJob("Updating layer to ${ContainerLayerUpdater.codeLabel(targetEntry)}…") { contents ->
+            layerUpdater.update(contents, container, targetEntry)
+        }
+    }
+
+    fun revertLayer(container: Container, snapshot: ContainerLayerUpdater.Snapshot) {
+        runLayerJob("Reverting layer to ${ContainerLayerUpdater.codeLabel(snapshot.oldEntry)}…") { contents ->
+            layerUpdater.revert(contents, container, snapshot)
+        }
+    }
+
+    private fun runLayerJob(busyText: String, job: (ContentsManager) -> Result<String>) {
+        if (_layerBusy.value != null) return
+        _layerBusy.value = busyText
+        viewModelScope.launch {
+            val result = withContext(Dispatchers.IO) {
+                job(ContentsManager(getApplication()).apply { syncContents() })
+            }
+            _layerBusy.value = null
+            _message.value = result.getOrElse { it.message ?: "Layer update failed" }
+            refresh()
+        }
     }
 
     fun messageShown() {
