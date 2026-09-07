@@ -2314,10 +2314,13 @@ private fun FileGridTile(
                     }
                 }
                 Spacer(Modifier.height(4.dp))
+                // Always reserve two lines (issue #475): a one-line name used to make its card shorter than
+                // its neighbours, so grid rows had ragged heights. Fixed min/max keeps every tile the same size.
                 Text(
                     file.name,
                     color = MaterialTheme.colorScheme.onSurface,
                     fontSize = 11.sp,
+                    minLines = 2,
                     maxLines = 2,
                     textAlign = androidx.compose.ui.text.style.TextAlign.Center,
                     overflow = TextOverflow.Ellipsis,

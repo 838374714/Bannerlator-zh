@@ -1,5 +1,11 @@
 # Star-Compose — Progress Log
 
+## 2026-09-06 — 🖱️🗂️ **Issue fixes: #431 Relative Mouse persisted per game · #475 file-manager card view uniform tile height** (branch `fix/relative-mouse-persist-card-height` off 3.0.7 main)
+> Triage session: closed #410 (fix `dc8e5fb6` already shipped in 3.0.5+, asked retest on 3.0.7), closed 8 game-specific reports with a community pointer, #453 pointed at the Mali report board. First two app-side fixes picked from what remained.
+> - **#431 (@sandzmi5):** `XServerDisplayActivity` — drawer `onRelativeMouseMovement` now persists extra `relativeMouse` to the shortcut (or the container when not shortcut-launched), mirroring the Present Mode / FPS-limiter owner rule; a seed block right after `xServer = new XServer(...)` reads it back (container → shortcut override), applies to the X server and echoes to `XServerDrawerState`. Disable Mouse stays session-only.
+> - **#475 (@Devaspe):** `FileManagerScreen.kt` `FileGridTile` name text `minLines = 2` so every card is the same height.
+> - ⏳ CI dispatched (artifacts, any-branch). Not device-proven.
+
 ## 2026-09-05 — 🎮📥 **Input Controls: ICP import flow — icon direction fix, Compose import chooser, per-profile layout preview** (branch `feat/icp-import-compose-preview` off `main` `ef7a8a17`, worktree `/home/claude-user/bannerlators-icp`)
 > User (3 screenshots): import/export arrows read backwards; the import source pop-up was a raw `android.app.AlertDialog.Builder` list (not our outlined Compose dialog); the Download Profiles list needed a "view example" per row like the On-Screen tab's preview. HTML mock (`/sdcard/Download/icp-import-preview.html`) approved, then implemented on a fresh branch.
 > - **Icons (`InputControlsScreen.kt` overflow menu):** Import ICP / ICpx → `FileDownload` (into the app, arrow down); Export ICpx + Export legacy ICP → `FileUpload` (out of the app, arrow up).
