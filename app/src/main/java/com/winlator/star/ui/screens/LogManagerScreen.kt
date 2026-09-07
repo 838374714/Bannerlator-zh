@@ -105,6 +105,18 @@ fun LogManagerScreen(onClose: () -> Unit) {
         mutableStateOf(prefs.getBoolean(com.winlator.star.store.blsteam.BlSteamEngineFlag.PREF_KEY,
             com.winlator.star.store.blsteam.BlSteamEngineFlag.DEFAULT))
     }
+    var rustEpicEngine by remember {
+        mutableStateOf(prefs.getBoolean(com.winlator.star.store.blsteam.BlStoreEngineFlag.PREF_KEY_EPIC,
+            com.winlator.star.store.blsteam.BlStoreEngineFlag.DEFAULT))
+    }
+    var rustGogEngine by remember {
+        mutableStateOf(prefs.getBoolean(com.winlator.star.store.blsteam.BlStoreEngineFlag.PREF_KEY_GOG,
+            com.winlator.star.store.blsteam.BlStoreEngineFlag.DEFAULT))
+    }
+    var rustAmazonEngine by remember {
+        mutableStateOf(prefs.getBoolean(com.winlator.star.store.blsteam.BlStoreEngineFlag.PREF_KEY_AMAZON,
+            com.winlator.star.store.blsteam.BlStoreEngineFlag.DEFAULT))
+    }
 
     // Location + channels moved here from the old Settings › Logs section, which this screen
     // replaces. They used to be saved by the Settings "Save" FAB; here every change is written
@@ -292,6 +304,27 @@ fun LogManagerScreen(onClose: () -> Unit) {
                     onInfo = { info = "Rust Steam engine" to LogCopy.RUST_ENGINE }) {
                     rustSteamEngine = it
                     putBool(com.winlator.star.store.blsteam.BlSteamEngineFlag.PREF_KEY, it)
+                }
+                // Per-store switches for the native download engines (docs/RUST_STORE_ENGINES.md).
+                // Read at download start by each store's Java manager, so a flip applies to the next
+                // download — no restart. OFF = that manager's existing Java fetch loop.
+                LogToggle("Rust engine: Epic downloads", rustEpicEngine,
+                    hint = "On by default — Epic file chunks are fetched by the native engine; takes effect on the next download. Off = Java downloader",
+                    onInfo = { info = "Rust store engines" to LogCopy.RUST_STORE_ENGINES }) {
+                    rustEpicEngine = it
+                    putBool(com.winlator.star.store.blsteam.BlStoreEngineFlag.PREF_KEY_EPIC, it)
+                }
+                LogToggle("Rust engine: GOG downloads", rustGogEngine,
+                    hint = "On by default — GOG depot chunks are fetched by the native engine; takes effect on the next download. Off = Java downloader",
+                    onInfo = { info = "Rust store engines" to LogCopy.RUST_STORE_ENGINES }) {
+                    rustGogEngine = it
+                    putBool(com.winlator.star.store.blsteam.BlStoreEngineFlag.PREF_KEY_GOG, it)
+                }
+                LogToggle("Rust engine: Amazon downloads", rustAmazonEngine,
+                    hint = "On by default — Amazon Games files are fetched by the native engine; takes effect on the next download. Off = Java downloader",
+                    onInfo = { info = "Rust store engines" to LogCopy.RUST_STORE_ENGINES }) {
+                    rustAmazonEngine = it
+                    putBool(com.winlator.star.store.blsteam.BlStoreEngineFlag.PREF_KEY_AMAZON, it)
                 }
 
                 // Outlined rather than a filled button: the design keeps solid accent for switches
@@ -1230,6 +1263,15 @@ private object LogCopy {
         "Java engine for this release — nothing is lost. While the native engine is on, its own log " +
         "is added to the SteamLite bundle so a problem can be traced."
 
+    const val RUST_STORE_ENGINES =
+        "On by default — no performance cost in game.\n\n" +
+        "Fetches Epic, GOG and Amazon game files with the app's native download engine (the same " +
+        "adaptive multi-connection fetcher the Steam engine uses). Everything else about a download " +
+        "— what is installed, resume, shortcuts, cloud saves — is unchanged.\n\n" +
+        "Each switch is read when a download starts, so flipping one applies to the next download " +
+        "of that store without a restart. Turn a store off if its downloads misbehave: that store " +
+        "goes back to its Java downloader — nothing is lost."
+
     fun explainAll(): String = buildString {
         append("Costs performance while on\n\n")
         append("• Wine debug\n$WINE\n\n")
@@ -1243,6 +1285,7 @@ private object LogCopy {
         append("• Folder for each game\n$PER_GAME\n\n")
         append("• Keep last runs\n$KEEP_LAST\n\n")
         append("\nDeveloper\n\n")
-        append("• Rust Steam engine\n$RUST_ENGINE\n")
+        append("• Rust Steam engine\n$RUST_ENGINE\n\n")
+        append("• Rust store engines (Epic / GOG / Amazon downloads)\n$RUST_STORE_ENGINES\n")
     }
 }
