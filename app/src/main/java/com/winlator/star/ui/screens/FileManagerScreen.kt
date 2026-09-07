@@ -37,6 +37,7 @@ import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Add
 import androidx.compose.material.icons.filled.ArrowBack
+import androidx.compose.material.icons.filled.ArrowUpward
 import androidx.compose.material.icons.filled.Bolt
 import androidx.compose.material.icons.filled.Checklist
 import androidx.compose.material.icons.filled.ContentPaste
@@ -405,19 +406,19 @@ fun FileManagerScreen(
     // the VOLUME ROOT of the start dir (internal /storage/emulated/0, or an SD card /storage/XXXX-XXXX),
     // NOT the start dir itself: otherwise opening at any subfolder disables up/back and traps the user
     // there. (Mirrors the volume-root logic in favLocationOf above.)
-    var currentRoot by remember {
-        val abs = rootDir.absolutePath
+    fun volumeRootOf(dir: File): File {
+        val abs = dir.absolutePath
         val internal = "/storage/emulated/0"
-        val vol = when {
+        return when {
             abs == internal || abs.startsWith("$internal/") -> File(internal)
             abs.startsWith("/storage/") -> {
                 val name = abs.removePrefix("/storage/").substringBefore('/')
-                if (name.isNotEmpty() && name != "emulated" && name != "self") File("/storage/$name") else rootDir
+                if (name.isNotEmpty() && name != "emulated" && name != "self") File("/storage/$name") else dir
             }
-            else -> rootDir
+            else -> dir
         }
-        mutableStateOf(vol)
     }
+    var currentRoot by remember { mutableStateOf(volumeRootOf(rootDir)) }
     var entries by remember { mutableStateOf(listOf<File>()) }
     var selectedEntry by remember { mutableStateOf<File?>(null) }
     var showMenuFor by remember { mutableStateOf<File?>(null) }
@@ -505,7 +506,25 @@ fun FileManagerScreen(
         loadDirectory(dir)
     }
 
-    LaunchedEffect(Unit) { openDrive(rootDir) }
+    // Jump to an arbitrary folder (favourite, quick location, caller-supplied start dir) WITHOUT
+    // pinning it as the floor: the floor stays the folder's volume root (or the container's C:
+    // drive when the target lives inside it), so up/back keep working above the jump target.
+    // Pinning the target itself was issue #476: after opening a favourite, the up arrow was greyed
+    // out and Back did nothing, because the favourite had become "the root".
+    fun jumpTo(dir: File) {
+        val dc = driveCPath?.takeIf { it.isDirectory }
+        currentRoot = if (dc != null && isWithin(dir, dc)) dc else volumeRootOf(dir)
+        loadDirectory(dir)
+    }
+
+    // One folder up, bounded at the current floor. Shared by the toolbar arrow, system Back and
+    // the ".." row at the top of every listing.
+    fun goUp() {
+        val parent = currentDir.parentFile
+        if (currentDir != currentRoot && parent != null && parent.exists()) loadDirectory(parent)
+    }
+
+    LaunchedEffect(Unit) { jumpTo(rootDir) }
 
     // System/gesture Back: while the Favorites view is open it closes that first; otherwise
     // it goes up one directory. Only at the current drive's root with Favorites closed is it
@@ -515,8 +534,7 @@ fun FileManagerScreen(
             showFavorites = false
             return@BackHandler
         }
-        val parent = currentDir.parentFile
-        if (parent != null && parent.exists()) loadDirectory(parent)
+        goUp()
     }
 
     fun canRun(file: File): Boolean {
@@ -1114,12 +1132,8 @@ fun FileManagerScreen(
                 .background(MaterialTheme.colorScheme.surfaceContainer)
                 .padding(horizontal = 8.dp, vertical = 6.dp),
         ) {
-            IconButton(onClick = {
-                val parent = currentDir.parentFile
-                // Don't climb above the current drive's root.
-                if (currentDir != currentRoot && parent != null && parent.exists()) loadDirectory(parent)
-            }, enabled = currentDir != currentRoot) {
-                Icon(Icons.Filled.ArrowBack, "Back", tint = MaterialTheme.colorScheme.primary)
+            IconButton(onClick = { goUp() }, enabled = currentDir != currentRoot) {
+                Icon(Icons.Filled.ArrowBack, "Parent folder", tint = MaterialTheme.colorScheme.primary)
             }
 
             // describeLocation labels C: by matching against the container list, which is empty in the
@@ -1525,13 +1539,19 @@ fun FileManagerScreen(
                 add(locItem("Drive C:", Icons.Filled.Storage, dc))
             }
         }
+        // Quick locations are shortcuts INTO internal storage, not drives: jump there but keep the
+        // floor at the storage root so the user can still climb out of Download/Games/Pictures.
+        fun quickItem(label: String, icon: androidx.compose.ui.graphics.vector.ImageVector, dir: File) =
+            RailItem(label, icon, !showFavorites && currentDir.absolutePath == dir.absolutePath) {
+                showFavorites = false; jumpTo(dir)
+            }
         val quickItems = buildList {
-            File("/storage/emulated/0/Download").takeIf { it.isDirectory }?.let { add(locItem("Downloads", Icons.Filled.Download, it)) }
-            File("/storage/emulated/0/Winlator/Games").takeIf { it.isDirectory }?.let { add(locItem("Games", Icons.Filled.SportsEsports, it)) }
-            File("/storage/emulated/0/Pictures").takeIf { it.isDirectory }?.let { add(locItem("Pictures", Icons.Filled.Image, it)) }
+            File("/storage/emulated/0/Download").takeIf { it.isDirectory }?.let { add(quickItem("Downloads", Icons.Filled.Download, it)) }
+            File("/storage/emulated/0/Winlator/Games").takeIf { it.isDirectory }?.let { add(quickItem("Games", Icons.Filled.SportsEsports, it)) }
+            File("/storage/emulated/0/Pictures").takeIf { it.isDirectory }?.let { add(quickItem("Pictures", Icons.Filled.Image, it)) }
         }
         val favItems = remember(favTick) { FavoritesStore.list(context).map(::File).filter { it.exists() } }
-            .map { d -> RailItem(d.name, Icons.Filled.Star, false) { showFavorites = false; openDrive(d) } }
+            .map { d -> RailItem(d.name, Icons.Filled.Star, false) { showFavorites = false; jumpTo(d) } }
         val locationSections = buildList {
             add(RailSection("STORAGE", storageItems))
             if (quickItems.isNotEmpty()) add(RailSection("QUICK", quickItems))
@@ -1560,7 +1580,7 @@ fun FileManagerScreen(
                 },
                 onJump = { dir ->
                     showFavorites = false
-                    openDrive(dir)
+                    jumpTo(dir)
                 },
                 onUnpin = { dir ->
                     FavoritesStore.remove(context, dir.absolutePath)
@@ -1585,6 +1605,9 @@ fun FileManagerScreen(
                     modifier = Modifier.fillMaxSize(),
                     contentPadding = PaddingValues(8.dp),
                 ) {
+                    if (searchQuery.isBlank() && currentDir != currentRoot) {
+                        item(key = "..") { ParentFolderTile(onTap = { goUp() }) }
+                    }
                     items(shownEntries, key = { it.absolutePath }) { file ->
                         val isFav = remember(file.absolutePath, favTick) {
                             FavoritesStore.isFavorite(context, file.absolutePath)
@@ -1654,6 +1677,11 @@ fun FileManagerScreen(
                 }
             } else
             LazyColumn(state = listState, modifier = Modifier.fillMaxSize()) {
+                // ".." as the first row of every listing below the floor — the Android file-manager
+                // convention (issue #476); hidden at the root and while a search filter is active.
+                if (searchQuery.isBlank() && currentDir != currentRoot) {
+                    item(key = "..") { ParentFolderRow(compact = compactRows, onTap = { goUp() }) }
+                }
                 if (entries.isEmpty()) {
                     item {
                         Box(
@@ -2511,5 +2539,50 @@ private fun AttributeToggleRow(
             enabled = enabled,
             onCheckedChange = onToggle,
         )
+    }
+}
+
+/** The ".." row: first entry of a listing, one folder up. Mirrors the list rows' height. */
+@Composable
+private fun ParentFolderRow(compact: Boolean, onTap: () -> Unit) {
+    Row(
+        modifier = Modifier
+            .fillMaxWidth()
+            .clickable(onClick = onTap)
+            .padding(horizontal = 16.dp, vertical = if (compact) 6.dp else 12.dp),
+        verticalAlignment = Alignment.CenterVertically,
+    ) {
+        Icon(
+            Icons.Filled.ArrowUpward,
+            contentDescription = "Parent folder",
+            tint = MaterialTheme.colorScheme.primary,
+            modifier = Modifier.size(if (compact) 20.dp else 24.dp),
+        )
+        Spacer(Modifier.width(16.dp))
+        Column {
+            Text("..", style = MaterialTheme.typography.bodyLarge, color = MaterialTheme.colorScheme.onSurface)
+            if (!compact) Text("Parent folder", style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+        }
+    }
+}
+
+/** Grid-mode counterpart of [ParentFolderRow]. */
+@Composable
+private fun ParentFolderTile(onTap: () -> Unit) {
+    Column(
+        modifier = Modifier
+            .padding(4.dp)
+            .clip(RoundedCornerShape(12.dp))
+            .clickable(onClick = onTap)
+            .padding(8.dp),
+        horizontalAlignment = Alignment.CenterHorizontally,
+    ) {
+        Icon(
+            Icons.Filled.ArrowUpward,
+            contentDescription = "Parent folder",
+            tint = MaterialTheme.colorScheme.primary,
+            modifier = Modifier.size(48.dp),
+        )
+        Text("..", style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurface)
     }
 }
