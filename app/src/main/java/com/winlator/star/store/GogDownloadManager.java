@@ -56,6 +56,8 @@ public final class GogDownloadManager {
 
     private static final String TAG = "BH_GOG_DL";
     private static final int TIMEOUT = 30_000;
+    /** Rust engine only: minimum inflate/hash/write pool (stream mode pins one chunk per worker). */
+    private static final int RUST_MIN_PROCESS_WORKERS = 16;
 
     public interface Callback {
         void onProgress(String msg, int pct);
@@ -1828,6 +1830,21 @@ public final class GogDownloadManager {
             anyFailed.set(true);
             return;
         }
+        // Improvement round 1: the Rust path takes its ceiling from the Steam speed tier (Fast =
+        // window 32) and at least RUST_MIN_PROCESS_WORKERS inflate/hash/write threads (stream mode
+        // pins each chunk to one pool worker). The Java loop keeps its own counts (maxWorkers /
+        // processWorkers are still what it would have used — logged for the A/B).
+        int rustWorkers = maxWorkers;
+        int rustProcess = Math.max(processWorkers, RUST_MIN_PROCESS_WORKERS);
+        try {
+            DownloadSpeedConfig cfg = new DownloadSpeedConfig(DownloadSpeedConfig.DEFAULT_TIER);
+            rustWorkers = Math.max(1, Math.min(128, cfg.getMaxNetworkWindow()));
+            rustProcess = Math.max(rustProcess, Math.max(1, Math.min(32, cfg.getMaxDecompress())));
+        } catch (Throwable t) {
+            log.add("rust engine: speed config unavailable (" + t + "), keeping Java counts");
+        }
+        log.add("rust engine concurrency: workers=" + rustWorkers + " process_workers=" + rustProcess
+                + " (java loop would use " + maxWorkers + ")");
         final String[] manifests = depotJsons.toArray(new String[0]);
         // Files completed by earlier runs of THIS download (refresh re-runs skip them silently).
         final java.util.Set<String> donePaths = java.util.concurrent.ConcurrentHashMap.newKeySet();
@@ -1883,7 +1900,7 @@ public final class GogDownloadManager {
             long handle = com.winlator.star.store.blsteam.BlGogDownload.start(
                     kind, manifests, base, installPath.getAbsolutePath(),
                     donePaths.toArray(new String[0]), caPath,
-                    maxWorkers, processWorkers, sortLargestFirst, label + " run=" + run, listener);
+                    rustWorkers, rustProcess, sortLargestFirst, label + " run=" + run, listener);
             if (handle == 0L) {
                 log.add("rust engine: start failed (see logcat BL_GOG_DL)");
                 anyFailed.set(true);

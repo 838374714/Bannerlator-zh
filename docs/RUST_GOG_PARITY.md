@@ -201,3 +201,32 @@ Both parsers run on the same strings; Java's `files.size()` (progress `total`) a
 5. Flag OFF: `engine=java` in `bh_gog_debug.txt`, no `BL_GOG_DL` lines — the loop is the old one.
 6. Gen1 title (a build with `generation=1` only): `engine=rust kind=gen1 label=gog gen1=<id>`,
    `fetch-start … mode=stream`, `plan resumed=… pending_files=…`, per-file "Downloading:" lines.
+
+## 11. Improvements round 1 (2026-09-07, user go: "raise the ceilings and fix the gog overhead")
+
+Device evidence (Gunslugs 3, 552 files / 555 chunks, 72 MB compressed): Rust 8.1-10.2 s vs Java
+~4.5 s with `fetch-window … window=16 in_flight=1 … budget_stalls=24`. Root cause: whole-body mode's
+24 MiB in-flight byte budget plus largest-first ordering — a few multi-MB chunks filled the budget,
+so 1-3 requests were actually in flight while the window said 16. Java streams 16 files straight
+to disk with no byte budget.
+
+What changed (Rust path only — the Java fallback keeps `resolveDownloadThreads` / 8 / 1):
+
+| Item | Before | Now |
+|---|---|---|
+| gen2 chunk items (base, DLC, dependency) | body mode: whole chunk buffered, then verify → inflate → verify → positioned write | **stream mode** (`FetchOptions.stream = true`): pieces are inflated as they arrive straight into the chunk's byte range of the `.bhtmp` (`flate2::write::ZlibDecoder` over a positioned `RangeWriter`); compressed MD5 accumulates per piece; decompressed size + MD5 accumulate as output is written; `on_finish` checks in Java's order (compressed size → compressed MD5 → inflate end → size → MD5), mismatch = `SinkError::Retry` exactly where Java retried; `offset == 0` = attempt restart (fresh inflater/hashers, the range is simply re-written); first byte `!= 0x78` = stored chunk pass-through (Java's `inflated = raw`); a corrupt zlib body mid-stream = Retry (Java: null → raw → size mismatch → retry). No in-flight byte budget in stream mode. |
+| ceiling (`max_workers`) | Java's pool size (`gog_dl_threads` / clamp(cores×2, 6, 16); DLC 8; dependency 1) | `DownloadSpeedConfig(DEFAULT_TIER).maxNetworkWindow` clamped 1..128 = **32** (Fast tier) for every gen2/gen1 run |
+| `per_host_cap` | = Java's pool size | `max(6, ceil(max_workers / distinct_hosts))` computed in the adapter = **32** on GOG's single CDN host |
+| `process_workers` | = Java's pool size | `max(Java pool size, 16, DownloadSpeedConfig.maxDecompress clamped 1..32)` ≥ **16**, because stream mode pins each item to one pool worker (`idx % process_workers`) |
+| ordering | largest-first (base) | unchanged — big chunks start streaming first, tiny files fill the tail |
+| everything else (skip/resume, `.bhtmp` + whole-file MD5 + rename, cancel, progress strings, secure-link refresh, post-install) | — | unchanged |
+
+Log grammar to grep on device (`adb logcat -s BL_GOG_DL`, also in `bh_gog_debug.txt`):
+- `rust engine concurrency: workers=32 process_workers=<P> (java loop would use <N>)`
+- `engine=rust kind=gen2 mode=stream label=gog base=<id> files=… chunks=… planned_bytes=… workers=32 per_host_cap=32 process_workers=<P> …`
+- core: `fetch-start … ceiling=32 … per_host_cap=32 … mode=stream`, `fetch-window … budget_stalls=0` (stream mode reserves nothing at dispatch)
+- `summary bytes=… elapsed=… avg_mbps=… peak_mbps=… items_ok=… success=true`
+
+Target: Gunslugs 3 ≤ Java's ~4.5 s and `budget_stalls=0`. If the per-worker channel pinning shows
+up as the limiter (a worker's queue backing up while others idle), that is a core change
+(work-stealing hand-off), not an adapter one.

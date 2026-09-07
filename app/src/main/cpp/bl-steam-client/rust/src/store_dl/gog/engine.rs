@@ -15,10 +15,11 @@
 
 use std::collections::HashSet;
 use std::fs::{self, File, OpenOptions};
+use std::io::Write;
 use std::os::unix::fs::FileExt;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use crate::fetch_core::{run_fetch, FetchItem, FetchOptions, FetchSink, SinkError};
@@ -35,6 +36,15 @@ pub const CHUNK_TIMEOUT: Duration = Duration::from_secs(30);
 pub const USER_AGENT: &str = "GOG Galaxy";
 /// Java staging suffix (`assembleDepotFile`).
 pub const TMP_SUFFIX: &str = ".bhtmp";
+/// Floor for the per-host cap (the core's default); a single-host store gets the whole ceiling.
+pub const PER_HOST_CAP_FLOOR: usize = 6;
+
+/// `max(6, ceil(max_workers / distinct_hosts))` — GOG's one CDN host gets the whole ceiling.
+pub fn per_host_cap_for(max_workers: usize, distinct_hosts: usize) -> usize {
+    let hosts = distinct_hosts.max(1);
+    let workers = max_workers.max(1);
+    PER_HOST_CAP_FLOOR.max(workers.div_ceil(hosts))
+}
 
 /// Which Java loop this run replaces.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -166,7 +176,7 @@ pub fn is_link_expiry_status(code: u16) -> bool {
 }
 
 struct FileState {
-    handle: Option<File>,
+    handle: Option<Arc<File>>,
     chunks_done: usize,
     finalized: bool,
     failed: bool,
@@ -219,12 +229,93 @@ impl SpeedSampler {
     }
 }
 
-/// The `FetchSink`: verify → inflate → verify → positioned write → (last chunk) finalize.
+/// Positioned writer for ONE chunk's decompressed byte range inside the file's `.bhtmp`: hashes
+/// everything it is given (the decompressed MD5) and counts it, but only writes bytes inside the
+/// chunk's expected range when the size is known — an inflate overshoot then fails the size
+/// check instead of clobbering the neighbouring chunk. An I/O error is remembered so the sink can
+/// tell "disk failed" (fatal) from "stream failed" (retry).
+struct RangeWriter {
+    file: Arc<File>,
+    base: u64,
+    expected: u64,
+    written: u64,
+    md5: crate::md5_small::Md5,
+    io_error: Option<String>,
+}
+
+impl RangeWriter {
+    fn new(file: Arc<File>, base: u64, expected: u64) -> Self {
+        Self {
+            file,
+            base,
+            expected,
+            written: 0,
+            md5: crate::md5_small::Md5::new(),
+            io_error: None,
+        }
+    }
+}
+
+impl Write for RangeWriter {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.md5.update(buf);
+        let start = self.written;
+        let end = start.saturating_add(buf.len() as u64);
+        let cap = if self.expected > 0 { self.expected } else { u64::MAX };
+        if start < cap {
+            let n = (end.min(cap) - start) as usize;
+            if let Err(err) = self.file.write_all_at(&buf[..n], self.base.saturating_add(start)) {
+                self.io_error = Some(err.to_string());
+                return Err(err);
+            }
+        }
+        self.written = end;
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+enum ChunkMode {
+    Zlib(flate2::write::ZlibDecoder<RangeWriter>),
+    Stored(RangeWriter),
+}
+
+/// Per-item streaming state for one attempt (reset whenever a piece arrives at `offset == 0`).
+struct ChunkStream {
+    comp_md5: crate::md5_small::Md5,
+    comp_len: u64,
+    /// Decided on the first non-empty piece (`0x78` → zlib, else stored — Java's `inflateZlib`).
+    mode: Option<ChunkMode>,
+    /// The writer until the mode is decided (an empty body never decides).
+    writer: Option<RangeWriter>,
+}
+
+impl ChunkStream {
+    fn new(file: Arc<File>, base: u64, expected: u64) -> Self {
+        Self {
+            comp_md5: crate::md5_small::Md5::new(),
+            comp_len: 0,
+            mode: None,
+            writer: Some(RangeWriter::new(file, base, expected)),
+        }
+    }
+}
+
+/// The `FetchSink`. Stream mode (what `run_gen2` uses): pieces of a chunk are inflated as they
+/// arrive straight into the chunk's byte range of the file, the compressed MD5 and the
+/// decompressed size/MD5 accumulate on the fly, and `on_finish` runs the checks in Java's order
+/// (compressed size → compressed MD5 → inflate → size → MD5). Body mode (`process`) is the same
+/// pipeline on a whole buffer and stays available for tests / a body-mode fallback.
 struct GogSink<'a> {
     files: &'a [PlannedFile],
     /// item id → (file index, chunk index)
     table: Vec<(usize, usize)>,
     states: Vec<Mutex<FileState>>,
+    /// item id → in-flight stream attempt (stream mode only)
+    streams: Vec<Mutex<Option<ChunkStream>>>,
     files_total: u32,
     bytes_total: u64,
     files_done: &'a AtomicU32,
@@ -236,6 +327,90 @@ struct GogSink<'a> {
 impl<'a> GogSink<'a> {
     fn log(&self, line: &str) {
         self.events.on_log(line);
+    }
+
+    /// `assembleDepotFile` head: `parent.mkdirs(); tmpFile.delete(); new FileOutputStream(tmp)` —
+    /// once per file, on its first chunk. Returns a shared handle for positioned writes.
+    fn file_handle(&self, file_idx: usize) -> Result<Arc<File>, SinkError> {
+        let file = &self.files[file_idx];
+        let mut st = self
+            .states
+            .get(file_idx)
+            .and_then(|m| m.lock().ok())
+            .ok_or_else(|| SinkError::Fatal("file state poisoned".to_string()))?;
+        if st.failed || st.finalized {
+            return Err(SinkError::Fatal(format!(
+                "chunk for a closed file: {}",
+                file.relative_path
+            )));
+        }
+        if let Some(h) = st.handle.as_ref() {
+            return Ok(Arc::clone(h));
+        }
+        if let Some(parent) = st.tmp_path.parent() {
+            let _ = fs::create_dir_all(parent);
+        }
+        let _ = fs::remove_file(&st.tmp_path);
+        let opened = OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(true)
+            .open(&st.tmp_path);
+        match opened {
+            Ok(h) => {
+                let h = Arc::new(h);
+                st.handle = Some(Arc::clone(&h));
+                Ok(h)
+            }
+            Err(err) => {
+                st.failed = true;
+                let msg = format!("open tmp failed file={} err={err}", file.relative_path);
+                self.log(&msg);
+                Err(SinkError::Fatal(msg))
+            }
+        }
+    }
+
+    /// One verified chunk landed: count it; on the file's last chunk run the whole-file verify +
+    /// rename and fire the per-file progress event (Java: doneCount++, totalBytes += df.totalSize,
+    /// "Downloading: <name>  <speed>").
+    fn chunk_done(&self, file_idx: usize) -> Result<(), SinkError> {
+        let file = &self.files[file_idx];
+        let mut st = self
+            .states
+            .get(file_idx)
+            .and_then(|m| m.lock().ok())
+            .ok_or_else(|| SinkError::Fatal("file state poisoned".to_string()))?;
+        if st.failed || st.finalized {
+            return Err(SinkError::Fatal(format!(
+                "chunk for a closed file: {}",
+                file.relative_path
+            )));
+        }
+        st.chunks_done += 1;
+        if st.chunks_done < file.chunks.len() {
+            return Ok(());
+        }
+        if let Err(err) = self.finalize_file(file_idx, &mut st) {
+            st.failed = true;
+            return Err(SinkError::Fatal(err));
+        }
+        drop(st);
+        let done = self.files_done.fetch_add(1, Ordering::Relaxed) + 1;
+        let bytes = self
+            .bytes_done
+            .fetch_add(file.total_size, Ordering::Relaxed)
+            + file.total_size;
+        self.events.on_file_done(
+            &file.relative_path,
+            file.total_size,
+            false,
+            done,
+            self.files_total,
+            bytes,
+            self.bytes_total,
+        );
+        Ok(())
     }
 
     /// `assembleDepotFile` tail: whole-file size + MD5 on the tmp, delete existing final, rename.
@@ -303,6 +478,8 @@ impl<'a> GogSink<'a> {
 }
 
 impl<'a> FetchSink for GogSink<'a> {
+    /// Body mode: `fetchChunkVerified` on a whole buffer, then a positioned write of the inflated
+    /// bytes (used by tests and available as a non-stream fallback).
     fn process(&self, item: &FetchItem, body: Vec<u8>) -> Result<u64, SinkError> {
         let Some(&(file_idx, chunk_idx)) = self.table.get(item.id as usize) else {
             return Err(SinkError::Fatal(format!("unknown item id {}", item.id)));
@@ -351,79 +528,174 @@ impl<'a> FetchSink for GogSink<'a> {
             return Err(SinkError::Retry(msg));
         }
 
-        let credited = inflated.len() as u64;
-        let mut st = self
-            .states
-            .get(file_idx)
-            .and_then(|m| m.lock().ok())
-            .ok_or_else(|| SinkError::Fatal("file state poisoned".to_string()))?;
-        if st.failed || st.finalized {
-            return Err(SinkError::Fatal(format!(
-                "chunk for a closed file: {}",
-                file.relative_path
-            )));
-        }
-        if st.handle.is_none() {
-            // assembleDepotFile head: parent.mkdirs(); tmpFile.delete(); new FileOutputStream(tmp)
-            if let Some(parent) = st.tmp_path.parent() {
-                let _ = fs::create_dir_all(parent);
+        let handle = self.file_handle(file_idx)?;
+        if let Err(err) = handle.write_all_at(&inflated, chunk.offset) {
+            if let Some(mut st) = self.states.get(file_idx).and_then(|m| m.lock().ok()) {
+                st.failed = true;
+                let _ = st.handle.take();
+                let _ = fs::remove_file(&st.tmp_path);
             }
-            let _ = fs::remove_file(&st.tmp_path);
-            let opened = OpenOptions::new()
-                .create(true)
-                .write(true)
-                .truncate(true)
-                .open(&st.tmp_path);
-            match opened {
-                Ok(h) => st.handle = Some(h),
-                Err(err) => {
-                    st.failed = true;
-                    let msg = format!("open tmp failed file={} err={err}", file.relative_path);
-                    self.log(&msg);
-                    return Err(SinkError::Fatal(msg));
-                }
-            }
-        }
-        let write = st
-            .handle
-            .as_ref()
-            .map(|h| h.write_all_at(&inflated, chunk.offset))
-            .unwrap_or_else(|| Err(std::io::Error::new(std::io::ErrorKind::Other, "no handle")));
-        if let Err(err) = write {
-            st.failed = true;
-            let _ = st.handle.take();
-            let _ = fs::remove_file(&st.tmp_path);
             let msg = format!("write failed file={} err={err}", file.relative_path);
             self.log(&msg);
             return Err(SinkError::Fatal(msg));
         }
-        st.chunks_done += 1;
-        if st.chunks_done < file.chunks.len() {
-            return Ok(credited);
-        }
-
-        // Last chunk of this file: whole-file verify + rename, then the per-file progress event
-        // (Java: doneCount++, totalBytes += df.totalSize, "Downloading: <name>  <speed>").
-        if let Err(err) = self.finalize_file(file_idx, &mut st) {
-            st.failed = true;
-            return Err(SinkError::Fatal(err));
-        }
-        drop(st);
-        let done = self.files_done.fetch_add(1, Ordering::Relaxed) + 1;
-        let bytes = self
-            .bytes_done
-            .fetch_add(file.total_size, Ordering::Relaxed)
-            + file.total_size;
-        self.events.on_file_done(
-            &file.relative_path,
-            file.total_size,
-            false,
-            done,
-            self.files_total,
-            bytes,
-            self.bytes_total,
-        );
+        drop(handle);
+        let credited = inflated.len() as u64;
+        self.chunk_done(file_idx)?;
         Ok(credited)
+    }
+
+    /// Stream mode: hash the compressed piece, inflate it straight into the chunk's byte range
+    /// (or pass it through for a stored chunk), hashing + counting the decompressed output.
+    fn on_chunk(&self, item: &FetchItem, offset: u64, data: &[u8]) -> Result<(), SinkError> {
+        let id = item.id as usize;
+        let Some(&(file_idx, chunk_idx)) = self.table.get(id) else {
+            return Err(SinkError::Fatal(format!("unknown item id {}", item.id)));
+        };
+        let file = &self.files[file_idx];
+        let chunk = &file.chunks[chunk_idx];
+        if let Ok(mut speed) = self.speed.lock() {
+            speed.record(data.len() as u64);
+        }
+        let mut slot = self
+            .streams
+            .get(id)
+            .and_then(|m| m.lock().ok())
+            .ok_or_else(|| SinkError::Fatal("chunk stream poisoned".to_string()))?;
+        if offset == 0 || slot.is_none() {
+            // (Re)start of an attempt: fresh hashers + inflater; positioned writes re-cover the range.
+            let handle = self.file_handle(file_idx)?;
+            *slot = Some(ChunkStream::new(handle, chunk.offset, chunk.size));
+        }
+        let Some(stream) = slot.as_mut() else {
+            return Err(SinkError::Fatal("chunk stream missing".to_string()));
+        };
+        stream.comp_md5.update(data);
+        stream.comp_len = stream.comp_len.saturating_add(data.len() as u64);
+        if data.is_empty() {
+            return Ok(());
+        }
+        if stream.mode.is_none() {
+            let writer = stream
+                .writer
+                .take()
+                .ok_or_else(|| SinkError::Fatal("chunk writer missing".to_string()))?;
+            stream.mode = Some(if data[0] == 0x78 {
+                ChunkMode::Zlib(flate2::write::ZlibDecoder::new(writer))
+            } else {
+                ChunkMode::Stored(writer) // stored (non-zlib) chunk — Java's `inflated = raw`
+            });
+        }
+        let result = match stream.mode.as_mut() {
+            Some(ChunkMode::Zlib(dec)) => dec
+                .write_all(data)
+                .map_err(|err| (err.to_string(), dec.get_ref().io_error.clone())),
+            Some(ChunkMode::Stored(w)) => w
+                .write_all(data)
+                .map_err(|err| (err.to_string(), w.io_error.clone())),
+            None => Ok(()),
+        };
+        match result {
+            Ok(()) => Ok(()),
+            Err((_, Some(io))) => {
+                // Disk, not stream: Java's `fos.write` exception → file fails → run aborts.
+                if let Some(mut st) = self.states.get(file_idx).and_then(|m| m.lock().ok()) {
+                    st.failed = true;
+                    let _ = st.handle.take();
+                    let _ = fs::remove_file(&st.tmp_path);
+                }
+                let msg = format!("write failed file={} err={io}", file.relative_path);
+                self.log(&msg);
+                Err(SinkError::Fatal(msg))
+            }
+            Err((err, None)) => {
+                // Corrupt zlib body. Java: inflate → null → raw → decompressed-size mismatch → retry.
+                let msg = format!("chunk inflate failed chunk={} err={err}", chunk.hash);
+                self.log(&msg);
+                *slot = None;
+                Err(SinkError::Retry(msg))
+            }
+        }
+    }
+
+    /// Stream mode: the body ended — run Java's checks in order and count the chunk.
+    fn on_finish(&self, item: &FetchItem, _total_len: u64) -> Result<u64, SinkError> {
+        let id = item.id as usize;
+        let Some(&(file_idx, chunk_idx)) = self.table.get(id) else {
+            return Err(SinkError::Fatal(format!("unknown item id {}", item.id)));
+        };
+        let file = &self.files[file_idx];
+        let chunk = &file.chunks[chunk_idx];
+        let taken = self
+            .streams
+            .get(id)
+            .and_then(|m| m.lock().ok())
+            .ok_or_else(|| SinkError::Fatal("chunk stream poisoned".to_string()))?
+            .take();
+        let stream = match taken {
+            Some(s) => s,
+            // Empty body with no pieces: same checks on zero bytes.
+            None => ChunkStream::new(self.file_handle(file_idx)?, chunk.offset, chunk.size),
+        };
+
+        if chunk.compressed_size > 0 && stream.comp_len != chunk.compressed_size {
+            let msg = format!(
+                "chunk compressed-size mismatch chunk={} exp={} got={}",
+                chunk.hash, chunk.compressed_size, stream.comp_len
+            );
+            self.log(&msg);
+            return Err(SinkError::Retry(msg));
+        }
+        if !chunk.compressed_md5.is_empty()
+            && !super::to_hex(&stream.comp_md5.finalize()).eq_ignore_ascii_case(&chunk.compressed_md5)
+        {
+            let msg = format!("chunk compressed-md5 mismatch chunk={}", chunk.hash);
+            self.log(&msg);
+            return Err(SinkError::Retry(msg));
+        }
+        let writer = match stream.mode {
+            Some(ChunkMode::Zlib(dec)) => match dec.finish() {
+                Ok(w) => w,
+                Err(err) => {
+                    let msg = format!("chunk inflate failed chunk={} err={err}", chunk.hash);
+                    self.log(&msg);
+                    return Err(SinkError::Retry(msg));
+                }
+            },
+            Some(ChunkMode::Stored(w)) => w,
+            None => match stream.writer {
+                Some(w) => w,
+                None => return Err(SinkError::Fatal("chunk writer missing".to_string())),
+            },
+        };
+        if let Some(io) = writer.io_error {
+            if let Some(mut st) = self.states.get(file_idx).and_then(|m| m.lock().ok()) {
+                st.failed = true;
+                let _ = st.handle.take();
+                let _ = fs::remove_file(&st.tmp_path);
+            }
+            let msg = format!("write failed file={} err={io}", file.relative_path);
+            self.log(&msg);
+            return Err(SinkError::Fatal(msg));
+        }
+        if chunk.size > 0 && writer.written != chunk.size {
+            let msg = format!(
+                "chunk decompressed-size mismatch chunk={} exp={} got={}",
+                chunk.hash, chunk.size, writer.written
+            );
+            self.log(&msg);
+            return Err(SinkError::Retry(msg));
+        }
+        if !chunk.md5.is_empty()
+            && !super::to_hex(&writer.md5.finalize()).eq_ignore_ascii_case(&chunk.md5)
+        {
+            let msg = format!("chunk decompressed-md5 mismatch chunk={}", chunk.hash);
+            self.log(&msg);
+            return Err(SinkError::Retry(msg));
+        }
+        drop(writer.file);
+        self.chunk_done(file_idx)?;
+        Ok(0)
     }
 }
 
@@ -447,15 +719,17 @@ fn run_gen2(req: &GogRequest, cancel: &AtomicBool, events: &dyn GogEvents) -> Go
     let max_workers = req.max_workers.max(1);
     let process_workers = req.process_workers.max(1);
     let host = host_key(&req.cdn_base);
+    let per_host_cap = per_host_cap_for(max_workers, 1);
 
     events.on_log(&format!(
-        "engine=rust kind=gen2 label={} files={} chunks={} planned_bytes={} skip_paths={} workers={} process_workers={} sort_largest_first={} host={}",
+        "engine=rust kind=gen2 mode=stream label={} files={} chunks={} planned_bytes={} skip_paths={} workers={} per_host_cap={} process_workers={} sort_largest_first={} host={}",
         req.label,
         files_total,
         chunk_count,
         planned_bytes,
         skip.len(),
         max_workers,
+        per_host_cap,
         process_workers,
         req.sort_largest_first,
         host
@@ -580,10 +854,12 @@ fn run_gen2(req: &GogRequest, cancel: &AtomicBool, events: &dyn GogEvents) -> Go
         };
     }
 
+    let streams: Vec<Mutex<Option<ChunkStream>>> = (0..table.len()).map(|_| Mutex::new(None)).collect();
     let sink = GogSink {
         files: &files,
         table,
         states,
+        streams,
         files_total,
         bytes_total: planned_bytes,
         files_done: &files_done,
@@ -594,15 +870,16 @@ fn run_gen2(req: &GogRequest, cancel: &AtomicBool, events: &dyn GogEvents) -> Go
     let hosts = vec![host];
     let opts = FetchOptions {
         max_workers,
-        // Java has no per-host cap: N pool threads all hit the single CDN host. The core clamps
-        // the window to hosts × per_host_cap, so the cap must equal the worker count.
-        per_host_cap: max_workers,
+        // One CDN host gets the whole ceiling (Java has no per-host cap either).
+        per_host_cap,
         timeout: CHUNK_TIMEOUT,
         headers: vec![("User-Agent".to_string(), USER_AGENT.to_string())],
         ca_bundle_path: req.ca_bundle_path.clone(),
         process_workers,
         label: req.label.clone(),
-        stream: false,
+        // Stream mode: pieces inflate straight to disk; no whole-body byte budget (the 24 MiB
+        // body budget + largest-first big chunks left 1-3 requests in flight at window 16).
+        stream: true,
     };
     let log = |line: &str| events.on_log(line);
     let progress = |_bytes: u64, _items_ok: u64| {};
@@ -785,13 +1062,15 @@ fn run_gen1(req: &GogRequest, cancel: &AtomicBool, events: &dyn GogEvents) -> Go
         .map(|f| host_key(&f.url))
         .unwrap_or_else(|| "https://none".to_string());
 
+    let per_host_cap = per_host_cap_for(max_workers, 1);
     events.on_log(&format!(
-        "engine=rust kind=gen1 label={} files={} planned_bytes={} skip_paths={} workers={} process_workers={} host={}",
+        "engine=rust kind=gen1 mode=stream label={} files={} planned_bytes={} skip_paths={} workers={} per_host_cap={} process_workers={} host={}",
         req.label,
         files_total,
         planned_bytes,
         skip.len(),
         max_workers,
+        per_host_cap,
         process_workers,
         host
     ));
@@ -889,7 +1168,7 @@ fn run_gen1(req: &GogRequest, cancel: &AtomicBool, events: &dyn GogEvents) -> Go
     let hosts = vec![host];
     let opts = FetchOptions {
         max_workers,
-        per_host_cap: max_workers,
+        per_host_cap,
         timeout: CHUNK_TIMEOUT,
         headers: vec![("User-Agent".to_string(), USER_AGENT.to_string())],
         ca_bundle_path: req.ca_bundle_path.clone(),
@@ -1066,6 +1345,7 @@ mod tests {
                 tmp_path: tmp_path.clone(),
                 out_path: out_path.clone(),
             })],
+            streams: vec![Mutex::new(None), Mutex::new(None)],
             files_total: 1,
             bytes_total: whole.len() as u64,
             files_done: &files_done,
@@ -1121,6 +1401,7 @@ mod tests {
                 tmp_path: tmp_path.clone(),
                 out_path: out_path.clone(),
             })],
+            streams: vec![Mutex::new(None)],
             files_total: 1,
             bytes_total: raw.len() as u64,
             files_done: &files_done,
@@ -1169,9 +1450,112 @@ mod tests {
         assert_eq!(res.files_verified, 1);
         assert_eq!(res.bytes_written, 0, "verified files credit no bytes (Java totalBytes)");
         let events = rec.events.lock().unwrap();
-        assert!(events[0].starts_with("log engine=rust kind=gen2 label=test files=2 chunks=2"), "{:?}", events[0]);
+        assert!(events[0].starts_with("log engine=rust kind=gen2 mode=stream label=test files=2 chunks=2"), "{:?}", events[0]);
         assert!(events.iter().any(|e| e == "done a.bin bytes=12 verified=true 1/2 total=0"), "{events:?}");
         assert!(!events.iter().any(|e| e.contains("skipped.bin")), "{events:?}");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn per_host_cap_gives_single_host_the_whole_ceiling() {
+        assert_eq!(per_host_cap_for(32, 1), 32);
+        assert_eq!(per_host_cap_for(32, 3), 11);
+        assert_eq!(per_host_cap_for(8, 1), 8);
+        assert_eq!(per_host_cap_for(4, 1), 6, "floor is the core default");
+        assert_eq!(per_host_cap_for(0, 0), 6);
+    }
+
+    /// Stream mode: zlib chunk split into pieces (with a poisoned first attempt restarting at
+    /// offset 0), a stored chunk, corrupt data → Retry, then the whole-file finalize.
+    #[test]
+    fn stream_sink_inflates_pieces_verifies_and_finalizes() {
+        use flate2::write::ZlibEncoder;
+        use flate2::Compression;
+
+        let dir = temp_dir("stream");
+        let part_a = b"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA".repeat(50); // 2000 bytes, compresses well
+        let part_b = b"\x01\x02stored bytes".to_vec(); // first byte != 0x78 → stored
+        let whole = [part_a.clone(), part_b.clone()].concat();
+        let mut enc = ZlibEncoder::new(Vec::new(), Compression::default());
+        enc.write_all(&part_a).unwrap();
+        let ca = enc.finish().unwrap();
+        assert_eq!(ca[0], 0x78);
+        let manifest = format!(
+            r#"{{"depot":{{"items":[{{"path":"out.bin","md5":"{}","chunks":[
+                {{"compressedMd5":"{}","md5":"{}","compressedSize":{},"size":{}}},
+                {{"compressedMd5":"{}","md5":"{}","compressedSize":{},"size":{}}}]}}]}}}}"#,
+            md5_hex(&whole),
+            md5_hex(&ca), md5_hex(&part_a), ca.len(), part_a.len(),
+            md5_hex(&part_b), md5_hex(&part_b), part_b.len(), part_b.len(),
+        );
+        let files = build_plan(&[manifest], true);
+        let out_path = dir.join("out.bin");
+        let tmp_path = PathBuf::from(format!("{}{}", out_path.display(), TMP_SUFFIX));
+        let files_done = AtomicU32::new(0);
+        let bytes_done = AtomicU64::new(0);
+        let rec = Recorder { events: StdMutex::new(Vec::new()) };
+        let sink = GogSink {
+            files: &files,
+            table: vec![(0, 0), (0, 1)],
+            states: vec![Mutex::new(FileState {
+                handle: None,
+                chunks_done: 0,
+                finalized: false,
+                failed: false,
+                tmp_path: tmp_path.clone(),
+                out_path: out_path.clone(),
+            })],
+            streams: vec![Mutex::new(None), Mutex::new(None)],
+            files_total: 1,
+            bytes_total: whole.len() as u64,
+            files_done: &files_done,
+            bytes_done: &bytes_done,
+            events: &rec,
+            speed: Mutex::new(SpeedSampler::new()),
+        };
+        let item = |id: u64| FetchItem { id, urls: vec!["x".into()], reserve: 0, range: None };
+
+        // Attempt 1 of the zlib chunk: corrupt tail → Retry from on_chunk.
+        let mut corrupt = ca.clone();
+        for b in corrupt.iter_mut().skip(2) {
+            *b = !*b;
+        }
+        let first_bad = sink.on_chunk(&item(0), 0, &corrupt);
+        match first_bad {
+            Err(SinkError::Retry(m)) => assert!(m.contains("inflate failed"), "{m}"),
+            Err(SinkError::Fatal(m)) => panic!("expected Retry, got Fatal({m})"),
+            Ok(()) => {
+                // Some corruptions only surface at finish: that must also be a Retry.
+                match sink.on_finish(&item(0), corrupt.len() as u64) {
+                    Err(SinkError::Retry(_)) => {}
+                    other => panic!("expected Retry at finish, got {}", match other {
+                        Ok(_) => "Ok".to_string(),
+                        Err(SinkError::Fatal(m)) => format!("Fatal({m})"),
+                        Err(SinkError::Retry(m)) => format!("Retry({m})"),
+                    }),
+                }
+            }
+        }
+        // Attempt 2: restart at offset 0 in three pieces.
+        let cut1 = ca.len() / 3;
+        let cut2 = 2 * ca.len() / 3;
+        sink.on_chunk(&item(0), 0, &ca[..cut1]).unwrap();
+        sink.on_chunk(&item(0), cut1 as u64, &ca[cut1..cut2]).unwrap();
+        sink.on_chunk(&item(0), cut2 as u64, &ca[cut2..]).unwrap();
+        assert_eq!(sink.on_finish(&item(0), ca.len() as u64).unwrap(), 0);
+        assert!(tmp_path.exists() && !out_path.exists());
+        // Stored chunk, one piece; wrong length first (→ Retry), then the real one.
+        sink.on_chunk(&item(1), 0, &part_b[..3]).unwrap();
+        match sink.on_finish(&item(1), 3) {
+            Err(SinkError::Retry(m)) => assert!(m.contains("compressed-size mismatch"), "{m}"),
+            _ => panic!("expected Retry on short stored chunk"),
+        }
+        sink.on_chunk(&item(1), 0, &part_b).unwrap();
+        assert_eq!(sink.on_finish(&item(1), part_b.len() as u64).unwrap(), 0);
+        assert!(out_path.exists() && !tmp_path.exists(), "renamed after the last chunk");
+        assert_eq!(fs::read(&out_path).unwrap(), whole);
+        assert_eq!(files_done.load(Ordering::Relaxed), 1);
+        assert_eq!(bytes_done.load(Ordering::Relaxed), whole.len() as u64);
         let _ = fs::remove_dir_all(&dir);
     }
 
@@ -1243,7 +1627,7 @@ mod tests {
         let res = run(&req, &cancel, &rec);
         assert!(res.cancelled, "{res:?}");
         let events = rec.events.lock().unwrap();
-        assert!(events[0].starts_with("log engine=rust kind=gen1 label= files=3"), "{:?}", events[0]);
+        assert!(events[0].starts_with("log engine=rust kind=gen1 mode=stream label= files=3"), "{:?}", events[0]);
         let _ = fs::remove_dir_all(&dir);
     }
 
