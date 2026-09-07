@@ -4,6 +4,7 @@ import android.app.Activity
 import android.content.Intent
 import android.net.Uri
 import androidx.compose.foundation.BorderStroke
+import androidx.compose.foundation.border
 import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
@@ -715,9 +716,13 @@ private fun ContainerItem(
                         verticalAlignment = Alignment.CenterVertically,
                         modifier = Modifier.padding(top = 4.dp),
                     ) {
+                        // Outline a shade lighter than the tonal fill so the pair reads as one control
+                        // against the dark card (user request on the r1 screenshot).
+                        val layerOutline = MaterialTheme.colorScheme.primary.copy(alpha = 0.55f)
                         FilledTonalButton(
                             onClick = { onUpdateLayer(layerUpdate) },
                             contentPadding = PaddingValues(horizontal = 10.dp, vertical = 0.dp),
+                            border = BorderStroke(1.dp, layerOutline),
                             modifier = Modifier.height(26.dp),
                         ) {
                             Text(
@@ -727,14 +732,17 @@ private fun ContainerItem(
                                 maxLines = 1,
                             )
                         }
+                        Spacer(Modifier.width(6.dp))
                         IconButton(
                             onClick = { onLayerHelp(layerUpdate) },
-                            modifier = Modifier.size(26.dp),
+                            modifier = Modifier
+                                .size(26.dp)
+                                .border(1.dp, layerOutline, CircleShape),
                         ) {
                             Icon(
                                 imageVector = Icons.Filled.HelpOutline,
                                 contentDescription = "About layer updates",
-                                tint = OnSurfaceVariant,
+                                tint = MaterialTheme.colorScheme.primary,
                                 modifier = Modifier.size(16.dp),
                             )
                         }
