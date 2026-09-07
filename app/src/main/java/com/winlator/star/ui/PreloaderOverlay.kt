@@ -604,7 +604,7 @@ private fun FailureCard(failure: Failure?) {
                         Text("Open log folder")
                     }
                     Spacer(Modifier.width(8.dp))
-                    Button(onClick = { PreloaderState.onClose?.run() }) {
+                    Button(onClick = { PreloaderState.close() }) {
                         Text("Close")
                     }
                 }
@@ -616,7 +616,7 @@ private fun FailureCard(failure: Failure?) {
                 )
                 Spacer(Modifier.height(12.dp))
                 Row(horizontalArrangement = Arrangement.End, modifier = Modifier.fillMaxWidth()) {
-                    Button(onClick = { PreloaderState.onClose?.run() }) {
+                    Button(onClick = { PreloaderState.close() }) {
                         Text("Close")
                     }
                 }
