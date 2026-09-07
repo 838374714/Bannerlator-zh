@@ -593,10 +593,17 @@ public class EpicDownloadManager {
 
             final int  totalChunks = neededChunks.size();
             final long fTotalBytes = totalBytes;
+            // Improvements round 1: the native path takes its ceilings from the Steam speed tier
+            // (Fast = window 32, decompress = cores/2) instead of the Java pool's fixed 8; the
+            // adapter splits the window across the distinct CDNs (per_host_cap). The Java
+            // fallback pool below keeps its own fixed counts.
+            DownloadSpeedConfig cfg = new DownloadSpeedConfig(DownloadSpeedConfig.DEFAULT_TIER);
+            final int rustWorkers = Math.max(1, Math.min(128, cfg.getMaxNetworkWindow()));
+            final int rustProcess = Math.max(2, Math.max(1, Math.min(32, cfg.getMaxDecompress())));
             com.winlator.star.store.blsteam.BlEpicDownload.Result res =
                     com.winlator.star.store.blsteam.BlEpicDownload.run(
                             manifestBytes, installDirPath, prefixes, pendingIdx, totalChunks, totalBytes,
-                            caPath, 8 /* Java pool width */, 2, cancelFlag,
+                            caPath, rustWorkers, rustProcess, cancelFlag,
                             new com.winlator.star.store.blsteam.BlEpicDownload.Listener() {
                 @Override public void onPlan(int chunksTotal, long bytesTotal, String chunkDir) {
                     synchronized (dbg) {

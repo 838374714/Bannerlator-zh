@@ -16,8 +16,8 @@ use crate::fetch_core::{run_fetch, FetchItem, FetchOptions, FetchSink, SinkError
 
 use super::manifest::{parse_manifest, Manifest};
 use super::plan::{
-    cached_chunk_path, chunk_cache_dir, chunk_url, distinct_prefixes, total_credit_bytes,
-    unique_chunks_for_files,
+    cached_chunk_path, chunk_cache_dir, chunk_url, distinct_prefixes, per_host_cap,
+    total_credit_bytes, unique_chunks_for_files,
 };
 
 /// Java `conn.setReadTimeout(60000)` — the longer of the two Java timeouts (connect was 30 s).
@@ -35,7 +35,8 @@ pub struct EpicRequest {
     pub expected_chunks: Option<u64>,
     pub expected_bytes: Option<u64>,
     pub ca_bundle_path: String,
-    /// Window ceiling — the Java pool is a fixed 8 (`super::JAVA_POOL_THREADS`).
+    /// Window ceiling: the Steam speed tier's network window (Fast = 32) since improvements
+    /// round 1; the Java fallback pool keeps its fixed 8 (`super::JAVA_POOL_THREADS`).
     pub max_workers: usize,
     pub process_workers: usize,
     pub label: String,
@@ -205,8 +206,9 @@ pub fn run_plan(
         bytes_total: plan.total_bytes,
         ..EpicOutcome::default()
     };
+    let host_cap = per_host_cap(req.max_workers, plan.hosts.len());
     log(&format!(
-        "plan chunk_dir={} files_pending={} chunks={} bytes={} hosts={} workers={} process_workers={}",
+        "plan chunk_dir={} files_pending={} chunks={} bytes={} hosts={} workers={} per_host_cap={host_cap} process_workers={}",
         plan.manifest.chunk_dir,
         req.pending_file_indices.len(),
         chunks_total,
@@ -278,16 +280,16 @@ pub fn run_plan(
 
     let opts = FetchOptions {
         max_workers: req.max_workers.max(1),
-        // Java's 8 threads all hit the first CDN unless it fails, so one host must be allowed to
-        // carry the whole window; the ceiling stays `max_workers` regardless of host count.
-        per_host_cap: req.max_workers.max(1),
+        // Improvements round 1: the tier ceiling split across the distinct CDNs (floor 6), so
+        // the whole window is reachable on 1 host or on all 3.
+        per_host_cap: host_cap,
         timeout: REQUEST_TIMEOUT,
         headers: vec![("User-Agent".to_string(), super::USER_AGENT.to_string())],
         ca_bundle_path: req.ca_bundle_path.clone(),
         process_workers: req.process_workers.max(1),
         label: req.label.clone(),
-        // Whole-body mode (Epic chunks are ≤1 MiB compressed); `stream` and any future field
-        // keep the core's defaults.
+        // Whole-body mode (Epic chunks are ≤ ~1 MiB compressed; the core's byte budget scales
+        // with the window); `stream` and any future field keep the core's defaults.
         ..FetchOptions::default()
     };
 

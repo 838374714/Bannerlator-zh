@@ -124,6 +124,16 @@ pub fn distinct_prefixes(cdn_prefixes: &[String]) -> Vec<String> {
     out
 }
 
+/// Improvements round 1: split the window across the distinct CDNs so the whole ceiling is
+/// reachable whatever the host count — `max(6, ceil(max_workers / hosts))` (3 Epic CDNs at a
+/// ceiling of 32 → 11 each; a single host gets all 32).
+pub fn per_host_cap(max_workers: usize, host_count: usize) -> usize {
+    let hosts = host_count.max(1);
+    let workers = max_workers.max(1);
+    let split = (workers + hosts - 1) / hosts;
+    split.max(6)
+}
+
 #[cfg(test)]
 mod tests {
     use super::super::manifest::test_support::*;
@@ -208,5 +218,15 @@ mod tests {
         );
         let prefixes = vec!["a".to_string(), "b".to_string(), "a".to_string()];
         assert_eq!(distinct_prefixes(&prefixes), vec!["a".to_string(), "b".to_string()]);
+    }
+
+    #[test]
+    fn per_host_cap_splits_the_window_with_a_floor_of_six() {
+        assert_eq!(per_host_cap(32, 3), 11);
+        assert_eq!(per_host_cap(32, 1), 32);
+        assert_eq!(per_host_cap(32, 2), 16);
+        assert_eq!(per_host_cap(8, 3), 6, "floor");
+        assert_eq!(per_host_cap(8, 1), 8);
+        assert_eq!(per_host_cap(0, 0), 6, "degenerate inputs");
     }
 }
