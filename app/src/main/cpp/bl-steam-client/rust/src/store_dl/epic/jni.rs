@@ -16,7 +16,6 @@
 //! failure returns 0 BEFORE any fetch and Java can fall back to its own pool; the fetch runs on
 //! a new thread. JavaVM attach / GlobalRef handling mirrors `crate::jni`.
 
-use std::ffi::CString;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::thread;
@@ -26,7 +25,6 @@ use jni::sys::{jint, jlong, JNI_FALSE, JNI_TRUE};
 use jni::{JNIEnv, JavaVM};
 
 use super::driver::{build_plan, run_plan, EpicRequest};
-use super::LOG_TAG;
 
 #[cfg(target_os = "android")]
 #[link(name = "log")]
@@ -37,7 +35,8 @@ unsafe extern "C" {
 fn android_log(message: &str) {
     #[cfg(target_os = "android")]
     {
-        let Ok(tag) = CString::new(LOG_TAG) else {
+        use std::ffi::CString;
+        let Ok(tag) = CString::new(super::LOG_TAG) else {
             return;
         };
         let sanitized = message.replace('\0', " ");
