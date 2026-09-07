@@ -316,7 +316,7 @@ public class AmazonDownloadManager {
         }
         String caPath;
         try {
-            caPath = CaBundleExtractor.ensureBundle(ctx);
+            caPath = CaBundleExtractor.INSTANCE.ensureBundle(ctx);
         } catch (Throwable t) {
             Log.w(RUST_TAG, "CA bundle unavailable, using system roots: " + t);
             caPath = "";
