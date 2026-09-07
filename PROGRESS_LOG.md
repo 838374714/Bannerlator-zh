@@ -1,5 +1,8 @@
 # Star-Compose — Progress Log
 
+## 2026-09-06 — ✅ **#431 + #475 MERGED to main `00ef3a07`** (revert `git revert -m 1 00ef3a07`) — user-confirmed on device, both issues replied + closed
+> Build `fix-431-475-r1` (run `34070719965`, sha `73ea0694…`) tested by the user: Relative Mouse survives relaunch per game; file-manager grid rows level. Merge file list verified = `XServerDisplayActivity.java`, `FileManagerScreen.kt`, `PROGRESS_LOG.md` only. Next release notes: credit **@sandzmi5** (#431) and **@Devaspe** (#475).
+
 ## 2026-09-06 — 🖱️🗂️ **Issue fixes: #431 Relative Mouse persisted per game · #475 file-manager card view uniform tile height** (branch `fix/relative-mouse-persist-card-height` off 3.0.7 main)
 > Triage session: closed #410 (fix `dc8e5fb6` already shipped in 3.0.5+, asked retest on 3.0.7), closed 8 game-specific reports with a community pointer, #453 pointed at the Mali report board. First two app-side fixes picked from what remained.
 > - **#431 (@sandzmi5):** `XServerDisplayActivity` — drawer `onRelativeMouseMovement` now persists extra `relativeMouse` to the shortcut (or the container when not shortcut-launched), mirroring the Present Mode / FPS-limiter owner rule; a seed block right after `xServer = new XServer(...)` reads it back (container → shortcut override), applies to the X server and echoes to `XServerDrawerState`. Disable Mouse stays session-only.
