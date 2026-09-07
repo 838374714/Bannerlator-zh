@@ -436,10 +436,12 @@ object EpicStoreCatalog {
     }
 
     /**
-     * Screenshots + trailers for a library game, or null when the store has none / anything fails
-     * (the caller then simply shows no Media tab). Blocking; IO thread only. Legacy offers
-     * (`productSlug` set) prefer the richer CMS page, modern ones their `keyImages`; each falls
-     * back to the other. 1 GraphQL search + at most one content GET + one batched resolve POST.
+     * Screenshots + trailers for a library game. [StoreMedia.EMPTY] when the offer was found but
+     * publishes nothing (cache it as a genuine "none"); null when the offer lookup itself failed —
+     * offline, a store hiccup, or a title not on the store — which the caller should cache only
+     * briefly (`StoreMediaCache.put(miss = true)`). Never throws. Blocking; IO thread only.
+     * Legacy offers (`productSlug` set) prefer the richer CMS page, modern ones their `keyImages`;
+     * each falls back to the other. 1 GraphQL search + at most one content GET + one resolve POST.
      */
     fun libraryGameMedia(namespace: String, catalogItemId: String): StoreMedia? = runCatching {
         val offer = offerForLibraryGame(namespace, catalogItemId) ?: return@runCatching null
@@ -448,9 +450,9 @@ object EpicStoreCatalog {
         val slug = pageSlugOf(offer)
         val fromPage = { if (slug.isNotBlank()) productPageMedia(slug) else null }
         val fromOffer = { parseOfferMedia(offer.optJSONArray("keyImages")).takeIf { !it.isEmpty }?.let { resolve(it) } }
-        val media = if (legacy) fromPage() ?: fromOffer() else fromOffer() ?: fromPage()
-        Log.i(TAG, "media ns=$namespace slug=$slug legacy=$legacy -> shots=${media?.screenshots?.size ?: 0} videos=${media?.videos?.size ?: 0}")
-        media?.takeIf { !it.isEmpty }
+        val media = (if (legacy) fromPage() ?: fromOffer() else fromOffer() ?: fromPage()) ?: StoreMedia.EMPTY
+        Log.i(TAG, "media ns=$namespace slug=$slug legacy=$legacy -> shots=${media.screenshots.size} videos=${media.videos.size}")
+        media
     }.onFailure { Log.w(TAG, "libraryGameMedia failed: ${it.message}") }.getOrNull()
 
     /**
