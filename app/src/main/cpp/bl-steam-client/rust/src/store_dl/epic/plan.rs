@@ -111,14 +111,31 @@ pub fn chunk_url(cdn_prefix: &str, chunk_dir: &str, chunk: &ChunkInfo) -> String
     format!("{}/{}", cdn_prefix, chunk.path(chunk_dir))
 }
 
-/// Distinct CDN prefixes in first-seen order (the fetch core wants one host key per distinct
-/// endpoint; Java would simply try an identical URL twice, which changes nothing).
+/// Undo the JSON string escaping the Java CDN scanner passes through. `EpicApiClient` re-serializes
+/// the manifest API response with Android's `org.json`, which escapes every `/` as `\/`, and
+/// `parseCdnUrls` takes the raw substrings — so a base URL arrives as `https:\/\/host\` and a cloud
+/// dir as `/Builds\/Org\/…\/default\`. Java's `HttpURLConnection` (OkHttp) treats `\` as `/` and
+/// only ever reached the first CDN, so it never noticed; reqwest's URL parser does the same
+/// mapping, which leaves empty `//` path segments that Fastly/Akamai tolerate but CloudFront
+/// rejects outright (immediate 4xx). Produce the URL Java intended: `\/` → `/`, any other `\`
+/// dropped, and no trailing slash (the chunk path is joined with one).
+pub fn normalize_prefix(raw: &str) -> String {
+    let unescaped = raw.replace("\\/", "/").replace('\\', "");
+    unescaped.trim_end_matches('/').to_string()
+}
+
+/// Distinct CDN prefixes in first-seen order, normalized (the fetch core wants one host key per
+/// distinct endpoint; Java would simply try an identical URL twice, which changes nothing).
 pub fn distinct_prefixes(cdn_prefixes: &[String]) -> Vec<String> {
     let mut seen = HashSet::new();
     let mut out = Vec::new();
     for p in cdn_prefixes {
-        if seen.insert(p.as_str()) {
-            out.push(p.clone());
+        let n = normalize_prefix(p);
+        if n.is_empty() {
+            continue;
+        }
+        if seen.insert(n.clone()) {
+            out.push(n);
         }
     }
     out
@@ -218,6 +235,29 @@ mod tests {
         );
         let prefixes = vec!["a".to_string(), "b".to_string(), "a".to_string()];
         assert_eq!(distinct_prefixes(&prefixes), vec!["a".to_string(), "b".to_string()]);
+    }
+
+    #[test]
+    fn prefixes_are_unescaped_from_the_java_json_scan() {
+        // Exactly what `bh_epic_debug.txt` shows Java extracting for a real title.
+        let raw = "https:\\/\\/egdownload.fastly-edge.com\\/Builds\\/Org\\/o-83e8\\/04b7\\/default\\";
+        assert_eq!(
+            normalize_prefix(raw),
+            "https://egdownload.fastly-edge.com/Builds/Org/o-83e8/04b7/default"
+        );
+        // Already-clean input is untouched (minus a trailing slash).
+        assert_eq!(
+            normalize_prefix("https://download.epicgames.com/Builds/x/default/"),
+            "https://download.epicgames.com/Builds/x/default"
+        );
+        let m = manifest();
+        let c = &m.unique_chunks[0];
+        assert_eq!(
+            chunk_url(&normalize_prefix(raw), "ChunksV4", c),
+            "https://egdownload.fastly-edge.com/Builds/Org/o-83e8/04b7/default/ChunksV4/05/0123456789ABCDEF_00000001000000020000000300000004.chunk"
+        );
+        let two = vec![raw.to_string(), "https://egdownload.fastly-edge.com/Builds/Org/o-83e8/04b7/default".to_string(), String::new()];
+        assert_eq!(distinct_prefixes(&two).len(), 1, "escaped and clean forms collapse; empty dropped");
     }
 
     #[test]

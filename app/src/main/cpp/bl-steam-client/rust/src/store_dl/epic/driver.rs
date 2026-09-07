@@ -243,6 +243,9 @@ pub fn run_plan(
             fetch_chunks.push(ci);
         }
     }
+    for (i, h) in plan.hosts.iter().enumerate() {
+        log(&format!("host[{i}]={h}"));
+    }
     log(&format!(
         "skip cached={pre_chunks} bytes={pre_bytes} to_fetch={}",
         fetch_chunks.len()

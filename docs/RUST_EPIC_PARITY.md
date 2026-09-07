@@ -209,3 +209,20 @@ host_stalls=…` → `summary bytes= decompressed= skipped_chunks= elapsed= avg_
 avg_MBps=` → `chunksOK=N`. The `max=` on the `fetch-window` line should now read 32 (3 CDNs ×
 11 = 33, clamped to the ceiling); `host_stalls` replacing `budget_stalls` as the binding
 constraint is expected and not a regression.
+
+### 6.1 CDN prefix normalization (round 2 device finding)
+
+Alone With You on the round-1 build: 13.6 s, no gain; `fetch-window` shrank to 2 on
+`shrink:err-burst` at t=0 (3 errors within 70 ms, `rtt=0ms`) and again every ~5 s (the core's
+cooled-host re-probe), err_rate 2.5-4.9 %. Cause: `EpicApiClient.getManifestApiJson` re-serializes
+the API response with Android `org.json`, which escapes `/` as `\/`; `parseCdnUrls` scans that
+text literally, so Java's `baseUrl` is `https:\/\/egdownload.fastly-edge.com\` and `cloudDir`
+is `/Builds\/Org\/…\/default\` (visible as-is in `bh_epic_debug.txt`'s `CDN:` lines). OkHttp maps
+`\` to `/` and Java only ever used CDN[0], so it never showed. reqwest maps the same way but the
+resulting `//` empty segments are rejected by CloudFront (`egs-cloudfront-chunks.epicgamescdn.com`)
+with an immediate 4xx, while Fastly/Akamai normalize them — hence one bad host out of three,
+demoted and re-probed every 5 s. Fix (adapter only, `plan.rs::normalize_prefix`, unit-tested):
+`\/` → `/`, stray `\` dropped, trailing `/` trimmed, so the Rust URL is the one Java intended
+(`https://host/Builds/Org/…/default/ChunksV4/NN/HASH_GUID.chunk`). The hosts are now logged one
+per line (`host[i]=…`) after the `plan` line. The Java scanner itself is untouched (the Java pool
+still works through OkHttp's tolerance). Chunk URLs remain unsigned, as in Java.
