@@ -655,6 +655,7 @@ class AmazonGamesActivity : ComponentActivity() {
                 j.put("versionId", g.versionId)
                 j.put("downloadSize", g.downloadSize)
                 j.put("installSize", g.installSize)
+                AmazonLibrarySync.putMedia(j, g)
                 arr.put(j)
             }
             prefs!!.edit().putString(CACHE_KEY, arr.toString()).apply()
@@ -684,6 +685,7 @@ class AmazonGamesActivity : ComponentActivity() {
                 g.versionId = j.optString("versionId", "")
                 g.downloadSize = j.optLong("downloadSize", 0L)
                 g.installSize = j.optLong("installSize", 0L)
+                AmazonLibrarySync.readMedia(j, g)
                 games.add(g)
             }
             return games

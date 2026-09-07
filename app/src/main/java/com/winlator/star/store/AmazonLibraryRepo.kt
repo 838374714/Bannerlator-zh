@@ -68,6 +68,7 @@ object AmazonLibraryRepo {
                 g.versionId = j.optString("versionId", "")
                 g.downloadSize = j.optLong("downloadSize", 0L)
                 g.installSize = j.optLong("installSize", 0L)
+                AmazonLibrarySync.readMedia(j, g)
                 if (g.productId.isNotEmpty()) out.add(g)
             }
             out.distinctBy { it.productId }.sortedBy { it.title.lowercase() }
@@ -202,6 +203,7 @@ object AmazonLibraryRepo {
                 j.put("versionId", g.versionId)
                 j.put("downloadSize", g.downloadSize)
                 j.put("installSize", g.installSize)
+                AmazonLibrarySync.putMedia(j, g)
                 arr.put(j)
             }
             p.edit().putString(CACHE_KEY, arr.toString()).apply()
