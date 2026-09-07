@@ -111,7 +111,7 @@ Every report gets its own **public discussion thread**. You can reply as the ori
 - [🤖 AI Disclaimer](#-ai-disclaimer)
 - [ℹ️ Information](#ℹ️-information)
 - [🐛 Report a Mali GPU Issue](#-report-a-mali-gpu-game-issue)
-- [🆕 What's New in 3.0.2](#-whats-new-in-302)
+- [🆕 What's New in 3.0.7](#-whats-new-in-307)
 - [🎞️ Frame Generation & Present Modes](#-frame-generation--present-modes)
 - [✨ Full Features](#-full-features)
 - [🎨 Adding your own ReShade effects](#-adding-your-own-reshade-effects)
@@ -124,7 +124,19 @@ Every report gets its own **public discussion thread**. You can reply as the ori
 
 ---
 
-## 🆕 What's New in 3.0.2
+## 🆕 What's New in 3.0.7
+
+**The EA update.** EA-published games in your **Steam library** launch the way they do on a PC — Steam starts EA Desktop, EA Desktop starts the game — and Bannerlator runs the whole chain for you. Entirely app-side — **no ImageFS reinstall**; install over 3.0.6 and everything carries over. Full notes: [`docs/releases/3.0.7.md`](docs/releases/3.0.7.md).
+
+- **🎮 EA games from your Steam library.** Origin-era and EA-app-era titles are detected and get an **EA** badge. The first launch offers a one-time **Set up EA Desktop** session (you click through EA's installer; the app handles Mono, Gecko, the registry and the Steam install script). After that it is press-play: the game starts through Steam and EA Desktop in the right order, and the session stays alive through EA's hand-offs. Device-proven with **Need for Speed Payback / Most Wanted (2012) / Rivals** and **STAR WARS Jedi: Survivor**. Needs the **SteamLite** launch mode (selected and remembered for EA titles), the new **`-4` compatibility layers** from the catalog and the hosted **SteamLite v7** client. Titles using EA's Javelin anti-cheat are refused up front.
+- **📦 New compatibility layers.** All seven Proton / GE-Proton layers rebuilt into a new `-arm64ec-4` slot ([`build-bionic-layers-20260906-eanet2`](https://github.com/The412Banner/proton-wine/releases/tag/build-bionic-layers-20260906-eanet2)): EA Desktop can go online (dual-stack DNS + a real default route) and, on the Wine 11 layers, EA's installer no longer aborts on a GDI+ assertion. Create a fresh container on a `-4` layer for EA titles; existing containers keep their layer.
+- **⚠️ EA limits to know.** Older EA games (e.g. Payback) ask for the EA sign-in on every launch, and EA counts each one — too many in a short period and EA refuses the game for a while ("too many computers"; clears in hours, or via *Deauthorize computers* in your EA account). Every container looks like a separate PC to EA. Need for Speed (2015) goes black after activation — open.
+- **🛑 When EA says no, you see why.** If EA Desktop refuses to license a game, a card names EA's reason with Retry / Open log folder / Close instead of a black screen.
+- **🕹️ Input Controls import rebuilt.** Arrows point the right way, a proper import chooser (in-app file manager / system picker / community list), and a per-row **preview** in Download Profiles so you can see a layout before importing it.
+- **🎞️ LSFG Native follow-ups.** Each generated frame is presented as soon as it is ready; the drawer shows the chain's GPU cost in ms per generated frame; the shader cache is built at import; the pacer's ceiling comes from the panel's top refresh mode.
+- **🛠️ Fixes.** HUD API line reads the game's real API on EA titles (D3D11 · DXVK, not D3D12); stray "EA" cards no longer appear in the Games grid; SteamLite / Goldberg updates can't leave the client missing; one broken shortcut file no longer crashes the app at start; EA titles render on app-built containers (ASCII install path); install-script registry parity with the real Steam client.
+
+### 🆕 Earlier — 3.0.2 (the Steam-focused update)
 
 **A Steam-focused update** on top of the `3.0.1` point release — Friends & Chat, real-Steam (VAC) online play, achievements & cloud saves, one-touch save syncing and SD-card installs, plus graphics / frame-gen and runtime polish. Entirely app-side — **no ImageFS reinstall**; install over 3.0.x and your containers, Wine installs, themes, accent colour and per-game settings all carry over. (Real-Steam is a separate one-time in-app download.)
 
