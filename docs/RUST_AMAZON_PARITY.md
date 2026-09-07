@@ -71,24 +71,24 @@ Java builds the plan from `manifest.allFiles` and serialises it as a JSON array
 
 | rule | Java line(s) (`AmazonDownloadManager.java`) | Rust status |
 |---|---|---|
-| Pool size `MAX_PARALLEL = 8` fixed threads, one task per file, all files submitted up front, futures joined in manifest order | 45, 150-165 | **1:1** on the window: `FetchOptions.max_workers = 8`, `per_host_cap = 8` (single CDN host, so the core's clamp hosts × cap = 8); items submitted in manifest order. See §9-A for the byte-budget caveat |
-| Whole-file GET, no Range | 256, 323-336 | **1:1** — one `FetchItem` per file, `range = None` |
+| Pool size `MAX_PARALLEL = 8` fixed threads, one task per file, all files submitted up front, futures joined in manifest order | 45, 150-165 | **1:1** — `FetchOptions.max_workers = 8`, `per_host_cap = 8` (single CDN host; the core honours hosts × cap = 8), `stream = true` so 8 whole files stream at once regardless of size (`reserve` is ignored in stream mode — no byte-budget serialisation); items submitted in manifest order |
+| Whole-file GET, no Range; body copied to the tmp in 64 KiB reads | 256, 323-346 | **1:1** — one `FetchItem` per file, `range = None`; stream mode appends each received piece to `<dest>.tmp` (`on_chunk`), so memory = pieces not yet written, like Java's 64 KiB buffer |
 | UA `nile/0.1 Amazon`, no auth header on file GETs | 48, 326 | **1:1** — `FetchOptions.headers = [("User-Agent","nile/0.1 Amazon")]` |
-| Timeouts connect 30 s / read 120 s | 324-325 | **≈** — the core has one `timeout` (whole request); set to 120 s. A connect stall fails at 120 s instead of 30 s (then retries) |
+| Timeouts connect 30 s / read 120 s | 324-325 | **≈** — stream mode: `timeout` (120 s) = response-headers deadline, then an idle deadline per received piece = Java's read timeout. A connect stall fails at 120 s instead of 30 s (then retries) |
 | HTTP non-2xx → `IOException("HTTP n")` → retry | 328-333 | **1:1** — core classifies non-200 as a failed attempt |
 | Resume-skip: `destFile.exists() && destFile.length() == file.size` → credit `size`, **no hash check on skip** | 250-253 | **1:1** — `amazon::is_present_and_complete` = `fs::metadata(dest).len() == size` (same `st_size` compare, same "no verify" rule); skipped bytes/files are credited into the first progress tick |
 | Skip check runs inside the worker (so it happens even while other files download) | 250 | **≈** — Rust computes skips at plan time before the window starts; same result, earlier |
 | `mkdirs` parent before each attempt | 260 | **1:1** — `create_dir_all(parent)` before writing tmp |
-| Download to `<dest>.tmp`, then SHA-256 the tmp file, compare to `hashBytes` | 247, 263-269 | **1:1 on disk** — body hashed in memory, written to `<dest>.tmp` only when the hash matches; a mismatch leaves no tmp (Java deletes it, `:271`) |
+| Download to `<dest>.tmp` (fresh `FileOutputStream` per attempt = truncate), then SHA-256 the tmp file, compare to `hashBytes` | 247, 263-269, 336 | **1:1** — `on_chunk(offset == 0)` = `File::create` (truncate) of `<dest>.tmp`, SHA-256 accumulated per piece, compared in `on_finish`; a mismatch deletes the tmp (Java `:271`) |
 | SHA-256 mismatch → delete tmp, sleep `1000 << (attempt-1)`, retry; give up after 3 | 269-277 | **DEVIATES (§9-C)** — mismatch returns `SinkError::Retry`, which the core counts as a failed attempt (rotate/backoff/≤5) |
 | `MAX_RETRIES = 3`, backoff 1 s / 2 s (no sleep after the 3rd) for I/O errors | 46, 258, 295-302 | **DEVIATES (§9-C)** — core retry policy (≤5 attempts, its own backoff) |
 | Rename: delete existing dest, `tmp.renameTo(dest)`; rename failure = file fails with NO retry | 280-284 | **1:1** — `remove_file(dest)` if present, `fs::rename`; failure → `SinkError::Fatal` |
 | Any file failing aborts the whole install (`pool.shutdownNow()`), `IN_PROGRESS` marker deleted, `return false` | 167-186 | **1:1** — `FetchOutcome.error` → Java branch logs `A file failed — aborting download`, `deleteMarker(IN_PROGRESS)`, `return false` |
-| Completed files are kept on failure/cancel (resume picks them up by size) | (no cleanup call; `cleanupTmpFiles` is dead code) | **1:1** — same on-disk layout, same `.tmp` name, same markers; a Java-started download resumes on Rust and vice versa |
-| Cancel checked per 64 KiB read; on cancel: `conn.disconnect()`, tmp deleted, task returns false → install returns false | 340-345, 286-289 | **≈** — `CancelChecker` polled every 100 ms by the facade → `nativeCancel` flips the core's `AtomicBool`; in-flight bodies are dropped, the sink refuses to write after cancel, so no `.tmp` survives. Java's caller then does the same `cancelled.get()` → `markCancelled` dance on both engines |
+| Completed files are kept on failure/cancel (resume picks them up by size); every failed/cancelled attempt deletes its tmp | 271, 288, 293, 297 (`cleanupTmpFiles` is dead code) | **1:1** — same on-disk layout, same `.tmp` name, same markers; `AmazonSink::cleanup_partials` deletes any tmp whose stream never reached `on_finish` (max attempts / cancel / fatal); a Java-started download resumes on Rust and vice versa |
+| Cancel checked per 64 KiB read; on cancel: `conn.disconnect()`, tmp deleted, task returns false → install returns false | 340-345, 286-289 | **≈** — `CancelChecker` polled every 100 ms by the facade → `nativeCancel` flips the core's `AtomicBool`; in-flight streams stop, the sink refuses further pieces, `cleanup_partials` deletes the partial tmps. Java's caller then does the same `cancelled.get()` → `markCancelled` dance on both engines |
 | Pause | — (`supportsPause = false`) | **shared** — none on either engine |
-| Progress: aggregate bytes counted per read; emitted when `dl - lastEmit >= 512 KiB` (CAS), speed sampled every ≥500 ms, label = `"<file>  <speed>"` | 47, 347-364 | **DEVIATES (§9-B)** — the core reports after each completed file; the Java branch keeps the SAME 512 KiB CAS gate + the same 500 ms speed sampler; label = `"<speed>"` (no per-file name) |
-| Retried attempts re-count their bytes (`totalDownloaded` is never rolled back) | 347 | **DEVIATES (§9-B, favourable)** — Rust credits a file once, on success |
+| Progress: aggregate bytes counted per read; emitted when `dl - lastEmit >= 512 KiB` (CAS), speed sampled every ≥500 ms, label = `"<file>  <speed>"` | 47, 347-364 | **1:1 on cadence** — stream mode credits every written piece to progress; the Java branch keeps the SAME 512 KiB CAS gate + the same 500 ms speed sampler. Label = `"<speed>"` only (§9-B, cosmetic) |
+| Retried attempts re-count their bytes (`totalDownloaded` is never rolled back) | 347 | **1:1** — stream mode: pieces of an attempt that later fails stay counted (`FetchOutcome.bytes_credited` doc) |
 | First tick `onProgress(0, total, "Starting…")` | 136-138 | **shared** (before the switch) |
 | Registry: `StoreDownloadHooks.tick(AMAZON, id, pct, installDone=dl, installTotal=total)` on every callback; FGS notification line from the same tick | callers (§1) | **shared** |
 | Error surfaces: `Log.e(BH_AMAZON, …)` + `bh_amazon_debug.txt` (single write at the end with `FAIL: <path>` lines); callers show "Download failed" / `markFailed` | 44, 161, 169-175, 216-228 | **1:1** — Rust log lines are appended to the same `dbg` buffer (and to logcat `BL_AMAZON_DL`); the failing file is in `FetchOutcome.error` |
@@ -111,7 +111,7 @@ and `runOnUiThread`/`withContext`), so this is transparent.
 
 | state | Java | Rust |
 |---|---|---|
-| in-flight file | `<dest>.tmp` partially written, deleted on cancel/failure | body in memory; `<dest>.tmp` exists only for the hash-verified write → rename window |
+| in-flight file | `<dest>.tmp` partially written, deleted on cancel/failure | `<dest>.tmp` partially written (pieces appended as they arrive), deleted by `cleanup_partials` on cancel/failure |
 | completed file | `<dest>` (renamed) | identical |
 | markers | `.amazon_download_in_progress` created at start, deleted on failure/cancel/success; `.amazon_download_complete` on success | identical (shared code) |
 | journal | none (size-based resume only) | none (same) |
@@ -120,38 +120,35 @@ and `runOnUiThread`/`withContext`), so this is transparent.
 
 Both engines: `ProgressCallback.onProgress(bytesDone, totalInstallSize, label)`; callers
 map it to `StoreDownloadHooks.tick` (registry row + shade notification) and their own
-labels. Rust keeps the Java 512 KiB / 500 ms gates so the registry and notification are
-not updated more often than today. Denser: never. Sparser: yes, for a single large file
-(see §9-B).
+labels. Rust credits every received piece (stream mode) and keeps the Java 512 KiB / 500 ms
+gates, so the registry and notification are updated at the same rhythm as today.
 
 ## 8. Log / proof
 
-- `adb logcat -s BL_AMAZON_DL` → `engine=rust plan=<n> files skip=<k> (<bytes>) fetch=<m> (<bytes>) hosts=1 workers=8`
+- `adb logcat -s BL_AMAZON_DL` → `engine=rust mode=stream plan=<n> files skip=<k> (<bytes>) fetch=<m> (<bytes>) hosts=1 workers=8`
+- `fetch-start label=amazon … mode=stream` from the core
 - `fetch-window … label=amazon …` lines from the core (same shape as Steam's `depot=` lines)
-- final `summary bytes=<n> elapsed=<s> avg_mbps=<x> peak_mbps=<y> files=<done>/<total>`
+- final `summary bytes=<n> elapsed=<s> avg_mbps=<x> peak_mbps=<y> files=<done>/<total> items_ok= tmp_removed= cancelled= error=`
 - the same lines are in `<externalFilesDir>/bh_amazon_debug.txt` (written once at the end,
   as today) prefixed `[rust] `.
 - Java engine (flag OFF, or `libblsteam.so` not usable): `engine=java` line only.
 
-## 9. Known deviations (all from the whole-body fetch core; morning items)
+## 9. Known deviations (morning items)
 
-- **A. Memory vs concurrency (byte budget).** The core delivers each body fully in memory,
-  and admits an item only while `in_flight == 0 || in_flight + reserve <= budget`
-  (`depot_writer::budget_admits`). With `reserve = file size` and a ceiling of 8 the budget
-  is `max(24 MiB, 8 × 1 MiB × 1.5)` = **24 MiB**: files ≤ 24 MiB pack into the window up to 8
-  wide (parity), files above it run **alone**. Java streams 8 files of any size at once with
-  64 KiB buffers. Throughput on big-file titles is therefore lower than Java tonight;
-  memory is bounded at ≈ budget + one oversized body. Fix (morning): Range-split large
-  files into `FetchItem`s with `range = Some(..)` writing positioned into one handle, or a
-  streaming sink in the core.
-- **B. Progress granularity.** Per-file instead of per-64 KiB read: a 2 GB single-file title
-  shows no movement until the file lands. Also the label carries speed only (no per-file
-  name, the detail page never showed it anyway). Retried attempts no longer double-credit.
-  Fix: a wire-progress hook in the core.
-- **C. Retry policy.** Core: ≤5 attempts with its own backoff; Java: 3 attempts, 1 s / 2 s.
-  Outcome class is the same (transient error → retried; hard failure → whole install
-  fails). Fix: `FetchOptions.max_attempts` / backoff override in the core.
-- **D. Timeout shape.** One 120 s request timeout vs 30 s connect + 120 s read.
+- **A. Memory vs concurrency — RESOLVED by stream mode.** `FetchOptions.stream = true`
+  streams each body into `<dest>.tmp` piece by piece; 8 files of any size run at once like
+  Java's pool and memory is bounded to the pieces not yet written (whole-body mode would have
+  serialised files > 24 MiB behind the byte budget).
+- **B. Label.** The progress label carries the speed only, not `"<file>  <speed>"` — the
+  detail page never displayed the file name; the store-list card shows the speed instead of
+  the file being written. Cosmetic.
+- **C. Retry policy.** Core: ≤ `MAX_ITEM_ATTEMPTS` with its own backoff + host rotation;
+  Java: 3 attempts, 1 s / 2 s. Outcome class is the same (transient error → retried; hard
+  failure → whole install fails). Fix: `FetchOptions.max_attempts` / backoff override.
+- **D. Timeout shape.** 120 s headers deadline + 120 s idle-per-piece vs 30 s connect + 120 s
+  read: a dead connect is noticed later (then retried).
 - **E. Cancel latency.** ≤100 ms poll vs per-read check; same on-disk result.
+- **F. Skip timing.** Resume-skip is evaluated for all files before the window starts instead
+  of inside each worker; same result, earlier.
 
 Everything else in §4 is 1:1.

@@ -7,30 +7,35 @@
 //! core allows it — see `docs/RUST_AMAZON_PARITY.md` §4 / §9 for the table and the
 //! documented deviations:
 //!
-//! * one `FetchItem` per WHOLE file (Java fetches whole files, no Range);
-//! * `reserve` = file size (byte budget; large files are admitted only when nothing else
-//!   is in flight — the memory-vs-concurrency caveat);
+//! * one `FetchItem` per WHOLE file, streamed (`FetchOptions.stream = true`): pieces are
+//!   appended to `<dest>.tmp` as they arrive, 8 files wide like Java's pool, memory bounded
+//!   to the pieces not yet written;
 //! * resume-skip = `st_size == manifest size`, no hash check on skip (Java `:250`);
-//! * body SHA-256 verified against the manifest when a hash is present; a mismatch is a
-//!   retryable failure (Java `:269`);
-//! * write `<dest>.tmp` → delete existing dest → rename (Java `:280`); rename failure is
-//!   fatal without retry (Java `:281`).
+//! * SHA-256 is accumulated while streaming and checked in `on_finish` when the manifest
+//!   carries a hash; a mismatch deletes the tmp and is a retryable failure (Java `:269`);
+//! * `<dest>.tmp` → delete existing dest → rename (Java `:280`); rename failure is fatal
+//!   without retry (Java `:281`);
+//! * a piece credits its wire length to progress as it is written (Java `:347`), and pieces
+//!   of an attempt that later fails stay counted (Java never rolls `totalDownloaded` back).
 
 pub mod jni;
 
 use crate::fetch_core::{run_fetch, FetchItem, FetchOptions, FetchSink, SinkError};
 use sha2::{Digest, Sha256};
-use std::fs;
-use std::path::{Path, PathBuf};
+use std::collections::HashMap;
+use std::fs::{self, File};
+use std::io::Write;
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 /// Java `AmazonDownloadManager.MAX_PARALLEL`.
 pub const MAX_PARALLEL: usize = 8;
 /// Java `AmazonDownloadManager.DOWNLOAD_USER_AGENT`.
 pub const DOWNLOAD_USER_AGENT: &str = "nile/0.1 Amazon";
-/// Java `conn.setReadTimeout(120000)`; the core has one whole-request timeout.
+/// Java `conn.setReadTimeout(120000)`; in stream mode the core applies this to the response
+/// headers and then as an idle deadline per received piece — the same shape as a read timeout.
 pub const REQUEST_TIMEOUT: Duration = Duration::from_secs(120);
 /// Java `new File(installDir, file.unixPath() + ".tmp")`.
 pub const TMP_SUFFIX: &str = ".tmp";
@@ -206,25 +211,34 @@ pub fn build_plan(entries: Vec<PlanEntry>, install_dir: &str) -> Plan {
     plan
 }
 
-/// Sink: SHA-256 verify → `<dest>.tmp` → rename. One whole file per `process` call.
+/// One `<dest>.tmp` being streamed: the open handle, the running hash and the bytes written
+/// by the current attempt.
+struct OpenTmp {
+    file: File,
+    hasher: Sha256,
+    written: u64,
+}
+
+/// Sink: stream pieces into `<dest>.tmp` (SHA-256 accumulated on the fly), verify and rename
+/// in `on_finish`. `process` (whole-body mode) does the same in one step.
 pub struct AmazonSink {
     install_dir: String,
     entries: Vec<PlanEntry>,
-    cancel: std::sync::Arc<AtomicBool>,
+    cancel: Arc<AtomicBool>,
     files_done: AtomicU64,
+    /// Per-item open tmp files. The map lock is held only to look the entry up; the write
+    /// itself happens under the per-item lock so 8 streams never serialise on one mutex.
+    open: Mutex<HashMap<u64, Arc<Mutex<OpenTmp>>>>,
 }
 
 impl AmazonSink {
-    pub fn new(
-        install_dir: &str,
-        entries: Vec<PlanEntry>,
-        cancel: std::sync::Arc<AtomicBool>,
-    ) -> Self {
+    pub fn new(install_dir: &str, entries: Vec<PlanEntry>, cancel: Arc<AtomicBool>) -> Self {
         Self {
             install_dir: install_dir.to_string(),
             entries,
             cancel,
             files_done: AtomicU64::new(0),
+            open: Mutex::new(HashMap::new()),
         }
     }
 
@@ -232,37 +246,29 @@ impl AmazonSink {
         self.files_done.load(Ordering::Relaxed)
     }
 
-    /// Java `downloadFileWithRetry` after a successful `downloadFile`: verify, then rename.
-    pub fn commit(&self, entry: &PlanEntry, body: &[u8]) -> Result<u64, SinkError> {
-        if !entry.sha256.is_empty() {
-            let digest = Sha256::digest(body);
-            if digest.as_slice() != entry.sha256.as_slice() {
-                // Java `:270`: tmp deleted, backoff, next attempt.
-                return Err(SinkError::Retry(format!(
-                    "SHA-256 mismatch for: {}",
-                    entry.rel_path
-                )));
-            }
-        }
-        let dest = dest_path(&self.install_dir, &entry.rel_path);
-        let tmp = tmp_path(&self.install_dir, &entry.rel_path);
-        if let Some(parent) = dest.parent() {
-            // Java `:260` mkdirs — a failure surfaces on the write below, like Java's.
+    fn entry(&self, item: &FetchItem) -> Result<&PlanEntry, SinkError> {
+        self.entries
+            .get(item.id as usize)
+            .ok_or_else(|| SinkError::Fatal(format!("plan index {} out of range", item.id)))
+    }
+
+    /// Java `:260` — `destFile.getParentFile().mkdirs()` before each attempt; a failure
+    /// surfaces on the create/write below, like Java's.
+    fn ensure_parent(&self, entry: &PlanEntry) {
+        if let Some(parent) = dest_path(&self.install_dir, &entry.rel_path).parent() {
             let _ = fs::create_dir_all(parent);
         }
-        if let Err(err) = fs::write(&tmp, body) {
-            // Java: IOException inside downloadFile → tmp deleted → retried.
-            let _ = fs::remove_file(&tmp);
-            return Err(SinkError::Retry(format!(
-                "write {}: {err}",
-                tmp.display()
-            )));
-        }
+    }
+
+    /// Java `:280-284`: delete an existing dest, rename tmp → dest; rename failure fails the
+    /// file with NO retry (→ whole install fails).
+    fn rename_into_place(&self, entry: &PlanEntry) -> Result<(), SinkError> {
+        let dest = dest_path(&self.install_dir, &entry.rel_path);
+        let tmp = tmp_path(&self.install_dir, &entry.rel_path);
         if dest.exists() {
             let _ = fs::remove_file(&dest);
         }
         if let Err(err) = fs::rename(&tmp, &dest) {
-            // Java `:281`: rename failure fails the file with no retry → whole install fails.
             let _ = fs::remove_file(&tmp);
             return Err(SinkError::Fatal(format!(
                 "Failed to rename tmp → {} ({err})",
@@ -270,20 +276,180 @@ impl AmazonSink {
             )));
         }
         self.files_done.fetch_add(1, Ordering::Relaxed);
+        Ok(())
+    }
+
+    /// Java `:267-277`: SHA-256 check when the manifest carries a hash; a mismatch deletes the
+    /// tmp and is retried.
+    fn verify(&self, entry: &PlanEntry, digest: &[u8]) -> Result<(), SinkError> {
+        if !entry.sha256.is_empty() && digest != entry.sha256.as_slice() {
+            let _ = fs::remove_file(tmp_path(&self.install_dir, &entry.rel_path));
+            return Err(SinkError::Retry(format!(
+                "SHA-256 mismatch for: {}",
+                entry.rel_path
+            )));
+        }
+        Ok(())
+    }
+
+    /// Whole-body path (`FetchOptions.stream = false`): verify → write tmp → rename.
+    pub fn commit(&self, entry: &PlanEntry, body: &[u8]) -> Result<u64, SinkError> {
+        if !entry.sha256.is_empty() {
+            let digest = Sha256::digest(body);
+            if digest.as_slice() != entry.sha256.as_slice() {
+                return Err(SinkError::Retry(format!(
+                    "SHA-256 mismatch for: {}",
+                    entry.rel_path
+                )));
+            }
+        }
+        self.ensure_parent(entry);
+        let tmp = tmp_path(&self.install_dir, &entry.rel_path);
+        if let Err(err) = fs::write(&tmp, body) {
+            let _ = fs::remove_file(&tmp);
+            return Err(SinkError::Retry(format!("write {}: {err}", tmp.display())));
+        }
+        self.rename_into_place(entry)?;
         Ok(body.len() as u64)
+    }
+
+    /// After the run: close and delete every tmp that never reached `on_finish` (a stream that
+    /// failed after max attempts, or was cut by cancel / a fatal error). Java deletes the tmp
+    /// of every failed or cancelled attempt (`:271`, `:288`, `:293`, `:297`), so no `.tmp`
+    /// may survive a run on either engine. Returns how many were removed.
+    pub fn cleanup_partials(&self) -> usize {
+        let leftovers: Vec<(u64, Arc<Mutex<OpenTmp>>)> = match self.open.lock() {
+            Ok(mut open) => open.drain().collect(),
+            Err(_) => return 0,
+        };
+        let mut removed = 0;
+        for (id, open) in leftovers {
+            drop(open);
+            if let Some(entry) = self.entries.get(id as usize) {
+                if fs::remove_file(tmp_path(&self.install_dir, &entry.rel_path)).is_ok() {
+                    removed += 1;
+                }
+            }
+        }
+        removed
     }
 }
 
 impl FetchSink for AmazonSink {
     fn process(&self, item: &FetchItem, body: Vec<u8>) -> Result<u64, SinkError> {
         if self.cancel.load(Ordering::Relaxed) {
-            // Java: cancel inside the read loop → tmp deleted, nothing committed.
             return Err(SinkError::Fatal("cancelled".to_string()));
         }
-        let Some(entry) = self.entries.get(item.id as usize) else {
-            return Err(SinkError::Fatal(format!("plan index {} out of range", item.id)));
-        };
+        let entry = self.entry(item)?;
         self.commit(entry, &body)
+    }
+
+    fn on_chunk(&self, item: &FetchItem, offset: u64, data: &[u8]) -> Result<(), SinkError> {
+        if self.cancel.load(Ordering::Relaxed) {
+            // Java `:342-344`: cancel inside the read loop → tmp deleted (cleanup_partials).
+            return Err(SinkError::Fatal("cancelled".to_string()));
+        }
+        let entry = self.entry(item)?;
+        let tmp = tmp_path(&self.install_dir, &entry.rel_path);
+        let open = if offset == 0 {
+            // (Re)start of an attempt: Java opens a fresh FileOutputStream (truncating).
+            self.ensure_parent(entry);
+            let file = File::create(&tmp).map_err(|err| {
+                let _ = fs::remove_file(&tmp);
+                SinkError::Retry(format!("create {}: {err}", tmp.display()))
+            })?;
+            let open = Arc::new(Mutex::new(OpenTmp {
+                file,
+                hasher: Sha256::new(),
+                written: 0,
+            }));
+            match self.open.lock() {
+                Ok(mut map) => {
+                    map.insert(item.id, Arc::clone(&open));
+                }
+                Err(_) => return Err(SinkError::Fatal("sink map poisoned".to_string())),
+            }
+            open
+        } else {
+            let found = match self.open.lock() {
+                Ok(map) => map.get(&item.id).cloned(),
+                Err(_) => return Err(SinkError::Fatal("sink map poisoned".to_string())),
+            };
+            match found {
+                Some(open) => open,
+                None => {
+                    return Err(SinkError::Retry(format!(
+                        "piece at offset {offset} without a stream start for: {}",
+                        entry.rel_path
+                    )))
+                }
+            }
+        };
+        let Ok(mut state) = open.lock() else {
+            return Err(SinkError::Fatal("sink item poisoned".to_string()));
+        };
+        if state.written != offset {
+            let _ = fs::remove_file(&tmp);
+            return Err(SinkError::Retry(format!(
+                "piece out of order ({} != {offset}) for: {}",
+                state.written, entry.rel_path
+            )));
+        }
+        if let Err(err) = state.file.write_all(data) {
+            // Java: IOException inside downloadFile → tmp deleted → next attempt.
+            let _ = fs::remove_file(&tmp);
+            return Err(SinkError::Retry(format!("write {}: {err}", tmp.display())));
+        }
+        state.hasher.update(data);
+        state.written = state.written.saturating_add(data.len() as u64);
+        Ok(())
+    }
+
+    fn on_finish(&self, item: &FetchItem, total_len: u64) -> Result<u64, SinkError> {
+        let entry = self.entry(item)?;
+        let tmp = tmp_path(&self.install_dir, &entry.rel_path);
+        let taken = match self.open.lock() {
+            Ok(mut map) => map.remove(&item.id),
+            Err(_) => return Err(SinkError::Fatal("sink map poisoned".to_string())),
+        };
+        let (written, digest) = match taken {
+            Some(open) => {
+                let Ok(mut state) = open.lock() else {
+                    return Err(SinkError::Fatal("sink item poisoned".to_string()));
+                };
+                if let Err(err) = state.file.flush() {
+                    let _ = fs::remove_file(&tmp);
+                    return Err(SinkError::Retry(format!("flush {}: {err}", tmp.display())));
+                }
+                let written = state.written;
+                let digest = std::mem::replace(&mut state.hasher, Sha256::new()).finalize();
+                (written, digest)
+            }
+            None => {
+                // Zero-byte body: no piece ever arrived. Java would have created an empty tmp.
+                if total_len != 0 {
+                    return Err(SinkError::Retry(format!(
+                        "finish without a stream for: {}",
+                        entry.rel_path
+                    )));
+                }
+                self.ensure_parent(entry);
+                if let Err(err) = File::create(&tmp) {
+                    return Err(SinkError::Retry(format!("create {}: {err}", tmp.display())));
+                }
+                (0, Sha256::new().finalize())
+            }
+        };
+        if written != total_len {
+            let _ = fs::remove_file(&tmp);
+            return Err(SinkError::Retry(format!(
+                "stream length {written} != {total_len} for: {}",
+                entry.rel_path
+            )));
+        }
+        self.verify(entry, digest.as_slice())?;
+        self.rename_into_place(entry)?;
+        Ok(0)
     }
 }
 
@@ -293,7 +459,8 @@ pub struct RunResult {
     pub success: bool,
     pub cancelled: bool,
     pub error: String,
-    /// Bytes fetched and committed by this run (skipped files excluded).
+    /// Bytes fetched by this run (skipped files excluded; failed attempts' pieces included,
+    /// like Java's `totalDownloaded`).
     pub bytes_written: u64,
     /// Files committed by this run plus files skipped by the resume check.
     pub files_done: u64,
@@ -340,17 +507,17 @@ impl SpeedMeter {
     }
 }
 
-/// Blocking: plan → fetch → verify/write, calling `progress(bytes_done, bytes_total,
-/// files_done, files_total)` after each committed file (skipped files are pre-credited) and
-/// `log` for every diagnostic line. `bytes_done` includes skipped bytes, matching Java's
-/// `totalDownloaded` (which credits skipped files at `:251`).
+/// Blocking: plan → stream-fetch → verify/rename, calling `progress(bytes_done, bytes_total,
+/// files_done, files_total)` after each written piece and each finished file (skipped files
+/// are pre-credited) and `log` for every diagnostic line. `bytes_done` includes skipped bytes,
+/// matching Java's `totalDownloaded` (which credits skipped files at `:251`).
 pub fn run_download(
     plan_json: &str,
     install_dir: &str,
     ca_bundle_path: &str,
     max_workers: usize,
     process_workers: usize,
-    cancel: std::sync::Arc<AtomicBool>,
+    cancel: Arc<AtomicBool>,
     progress: &(dyn Fn(u64, u64, u64, u64) + Sync),
     log: &(dyn Fn(&str) + Sync),
 ) -> RunResult {
@@ -370,7 +537,7 @@ pub fn run_download(
     let files_total = plan.entries.len() as u64;
     let fetch_bytes: u64 = plan.items.iter().map(|item| item.reserve).sum();
     log(&format!(
-        "engine=rust plan={} files skip={} ({} bytes) fetch={} ({} bytes) hosts={} workers={} process={} dir={}",
+        "engine=rust mode=stream plan={} files skip={} ({} bytes) fetch={} ({} bytes) hosts={} workers={} process={} dir={}",
         files_total,
         plan.skipped_files,
         plan.skipped_bytes,
@@ -411,8 +578,12 @@ pub fn run_download(
         ca_bundle_path: ca_bundle_path.to_string(),
         process_workers,
         label: LABEL.to_string(),
+        // Whole files, streamed into the tmp as they arrive: 8 wide like Java's pool, memory
+        // bounded to the pieces not yet written.
+        stream: true,
+        ..FetchOptions::default()
     };
-    let sink = AmazonSink::new(install_dir, plan.entries.clone(), std::sync::Arc::clone(&cancel));
+    let sink = AmazonSink::new(install_dir, plan.entries.clone(), Arc::clone(&cancel));
     let meter = Mutex::new(SpeedMeter::new());
     let skipped_bytes = plan.skipped_bytes;
     let skipped_files = plan.skipped_files;
@@ -437,13 +608,14 @@ pub fn run_download(
         &progress_cb,
         log,
     );
+    let leftovers = sink.cleanup_partials();
     let (elapsed, avg_mbps, peak_mbps) = meter
         .lock()
         .map(|meter| meter.summary(outcome.bytes_credited))
         .unwrap_or((0.0, 0.0, 0.0));
     let files_done = skipped_files.saturating_add(sink.files_done());
     log(&format!(
-        "summary bytes={} elapsed={:.3} avg_mbps={:.1} peak_mbps={:.1} files={}/{} items_ok={} cancelled={} error={}",
+        "summary bytes={} elapsed={:.3} avg_mbps={:.1} peak_mbps={:.1} files={}/{} items_ok={} tmp_removed={} cancelled={} error={}",
         outcome.bytes_credited,
         elapsed,
         avg_mbps,
@@ -451,6 +623,7 @@ pub fn run_download(
         files_done,
         files_total,
         outcome.items_ok,
+        leftovers,
         outcome.cancelled,
         outcome.error.as_deref().unwrap_or("")
     ));
@@ -474,7 +647,6 @@ pub fn run_download(
 mod tests {
     use super::*;
     use std::sync::atomic::AtomicUsize;
-    use std::sync::Arc;
 
     static COUNTER: AtomicUsize = AtomicUsize::new(0);
 
@@ -492,6 +664,15 @@ mod tests {
 
     fn sha_hex(data: &[u8]) -> String {
         crate::cdn_client::hex_encode(Sha256::digest(data).as_slice())
+    }
+
+    fn item_for(entry: &PlanEntry, id: u64) -> FetchItem {
+        FetchItem {
+            id,
+            urls: vec![entry.url.clone()],
+            reserve: entry.size,
+            range: None,
+        }
     }
 
     const PLAN: &str = r#"[
@@ -589,7 +770,7 @@ mod tests {
     }
 
     #[test]
-    fn sink_verifies_writes_and_renames() {
+    fn whole_body_sink_verifies_writes_and_renames() {
         let dir = scratch_dir();
         let body = b"test".to_vec();
         let entry = PlanEntry {
@@ -600,12 +781,7 @@ mod tests {
         };
         let cancel = Arc::new(AtomicBool::new(false));
         let sink = AmazonSink::new(&dir, vec![entry.clone()], Arc::clone(&cancel));
-        let item = FetchItem {
-            id: 0,
-            urls: vec![entry.url.clone()],
-            reserve: 4,
-            range: None,
-        };
+        let item = item_for(&entry, 0);
         // Mismatch → Retry, nothing on disk.
         match sink.process(&item, b"nope".to_vec()) {
             Err(SinkError::Retry(msg)) => assert!(msg.contains("SHA-256 mismatch")),
@@ -631,7 +807,110 @@ mod tests {
     }
 
     #[test]
-    fn sink_skips_hash_when_manifest_has_none() {
+    fn stream_sink_appends_verifies_and_renames() {
+        let dir = scratch_dir();
+        let body = b"hello world".to_vec();
+        let entry = PlanEntry {
+            rel_path: "sub/big.bin".into(),
+            url: "https://h/x".into(),
+            size: body.len() as u64,
+            sha256: hex_decode(&sha_hex(&body)).unwrap(),
+        };
+        let sink = AmazonSink::new(&dir, vec![entry.clone()], Arc::new(AtomicBool::new(false)));
+        let item = item_for(&entry, 0);
+        sink.on_chunk(&item, 0, b"hello").unwrap();
+        assert!(tmp_path(&dir, "sub/big.bin").exists());
+        sink.on_chunk(&item, 5, b" wor").unwrap();
+        sink.on_chunk(&item, 9, b"ld").unwrap();
+        assert_eq!(sink.on_finish(&item, 11).unwrap(), 0);
+        assert_eq!(fs::read(dest_path(&dir, "sub/big.bin")).unwrap(), body);
+        assert!(!tmp_path(&dir, "sub/big.bin").exists());
+        assert_eq!(sink.files_done(), 1);
+        assert_eq!(sink.cleanup_partials(), 0);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn stream_sink_restart_truncates_and_mismatch_retries() {
+        let dir = scratch_dir();
+        let body = b"abcdef".to_vec();
+        let entry = PlanEntry {
+            rel_path: "f.bin".into(),
+            url: "https://h/x".into(),
+            size: 6,
+            sha256: hex_decode(&sha_hex(&body)).unwrap(),
+        };
+        let sink = AmazonSink::new(&dir, vec![entry.clone()], Arc::new(AtomicBool::new(false)));
+        let item = item_for(&entry, 0);
+        // Attempt 1 delivers garbage, then the core restarts at offset 0.
+        sink.on_chunk(&item, 0, b"zzzz").unwrap();
+        sink.on_chunk(&item, 0, b"abc").unwrap();
+        sink.on_chunk(&item, 3, b"xyz").unwrap();
+        match sink.on_finish(&item, 6) {
+            Err(SinkError::Retry(msg)) => assert!(msg.contains("SHA-256 mismatch")),
+            Err(SinkError::Fatal(msg)) => panic!("expected Retry, got Fatal({msg})"),
+            Ok(_) => panic!("expected Retry, got Ok"),
+        }
+        assert!(!tmp_path(&dir, "f.bin").exists());
+        assert!(!dest_path(&dir, "f.bin").exists());
+        // Out-of-order piece → Retry.
+        sink.on_chunk(&item, 0, b"abc").unwrap();
+        assert!(matches!(
+            sink.on_chunk(&item, 5, b"f"),
+            Err(SinkError::Retry(_))
+        ));
+        // Length mismatch at finish → Retry.
+        sink.on_chunk(&item, 0, b"abc").unwrap();
+        assert!(matches!(sink.on_finish(&item, 6), Err(SinkError::Retry(_))));
+        // Piece without a start → Retry.
+        assert!(matches!(
+            sink.on_chunk(&item, 3, b"def"),
+            Err(SinkError::Retry(_))
+        ));
+        // Good attempt.
+        sink.on_chunk(&item, 0, b"abc").unwrap();
+        sink.on_chunk(&item, 3, b"def").unwrap();
+        assert_eq!(sink.on_finish(&item, 6).unwrap(), 0);
+        assert_eq!(fs::read(dest_path(&dir, "f.bin")).unwrap(), body);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn stream_sink_cleanup_removes_unfinished_tmp_and_zero_len_finishes() {
+        let dir = scratch_dir();
+        let big = PlanEntry {
+            rel_path: "cut.bin".into(),
+            url: "https://h/x".into(),
+            size: 10,
+            sha256: Vec::new(),
+        };
+        let empty = PlanEntry {
+            rel_path: "empty.bin".into(),
+            url: "https://h/y".into(),
+            size: 0,
+            sha256: Vec::new(),
+        };
+        let cancel = Arc::new(AtomicBool::new(false));
+        let sink = AmazonSink::new(&dir, vec![big.clone(), empty.clone()], Arc::clone(&cancel));
+        sink.on_chunk(&item_for(&big, 0), 0, b"12345").unwrap();
+        assert!(tmp_path(&dir, "cut.bin").exists());
+        // Zero-byte body: on_finish with no pieces creates and commits an empty file.
+        assert_eq!(sink.on_finish(&item_for(&empty, 1), 0).unwrap(), 0);
+        assert_eq!(fs::read(dest_path(&dir, "empty.bin")).unwrap(), b"");
+        // Cancel mid-stream → Fatal; cleanup deletes the partial tmp like Java does.
+        cancel.store(true, Ordering::Relaxed);
+        assert!(matches!(
+            sink.on_chunk(&item_for(&big, 0), 5, b"6"),
+            Err(SinkError::Fatal(_))
+        ));
+        assert_eq!(sink.cleanup_partials(), 1);
+        assert!(!tmp_path(&dir, "cut.bin").exists());
+        assert!(!dest_path(&dir, "cut.bin").exists());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn stream_sink_skips_hash_when_manifest_has_none() {
         let dir = scratch_dir();
         let entry = PlanEntry {
             rel_path: "a.bin".into(),
@@ -639,14 +918,10 @@ mod tests {
             size: 3,
             sha256: Vec::new(),
         };
-        let sink = AmazonSink::new(&dir, vec![entry], Arc::new(AtomicBool::new(false)));
-        let item = FetchItem {
-            id: 0,
-            urls: vec!["https://h/x".into()],
-            reserve: 3,
-            range: None,
-        };
-        assert_eq!(sink.process(&item, b"abc".to_vec()).unwrap(), 3);
+        let sink = AmazonSink::new(&dir, vec![entry.clone()], Arc::new(AtomicBool::new(false)));
+        let item = item_for(&entry, 0);
+        sink.on_chunk(&item, 0, b"abc").unwrap();
+        assert_eq!(sink.on_finish(&item, 3).unwrap(), 0);
         assert_eq!(fs::read(dest_path(&dir, "a.bin")).unwrap(), b"abc");
         let _ = fs::remove_dir_all(&dir);
     }
@@ -672,7 +947,7 @@ mod tests {
         assert_eq!(result.files_done, 1);
         assert_eq!(result.files_total, 1);
         assert_eq!(seen.lock().unwrap().as_slice(), &[(3, 3, 1, 1)]);
-        assert!(logs.lock().unwrap()[0].starts_with("engine=rust"));
+        assert!(logs.lock().unwrap()[0].starts_with("engine=rust mode=stream"));
         let _ = fs::remove_dir_all(&dir);
     }
 
