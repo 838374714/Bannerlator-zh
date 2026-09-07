@@ -177,6 +177,7 @@ fun LogManagerScreen(onClose: () -> Unit) {
     val entries = remember(refreshTick, perGame) { LogInventory.scan(context) }
 
     fun putBool(key: String, v: Boolean) = prefs.edit().putBoolean(key, v).apply()
+    var storeDlTier by remember { mutableStateOf(com.winlator.star.store.StoreDownloadTier.get(context)) }
 
     Surface(modifier = Modifier.fillMaxSize(), color = MaterialTheme.colorScheme.background) {
         Column(
@@ -325,6 +326,19 @@ fun LogManagerScreen(onClose: () -> Unit) {
                     onInfo = { info = "Rust store engines" to LogCopy.RUST_STORE_ENGINES }) {
                     rustAmazonEngine = it
                     putBool(com.winlator.star.store.blsteam.BlStoreEngineFlag.PREF_KEY_AMAZON, it)
+                }
+                // One app-wide speed tier for the three store engines (Steam keeps its per-download
+                // picker). Tap cycles Slow → Medium → Fast → Blazing; it is only the ceiling the
+                // adaptive window may ramp to, so a weak link still settles below it. Next download.
+                Spacer(Modifier.height(4.dp))
+                PickRow(
+                    "Store download speed",
+                    "Ceiling for the Rust Epic / GOG / Amazon engines. Tap to change; applies to the next download.",
+                    action = com.winlator.star.store.StoreDownloadTier.label(storeDlTier),
+                    onInfo = { info = "Rust store engines" to LogCopy.RUST_STORE_ENGINES },
+                ) {
+                    storeDlTier = com.winlator.star.store.StoreDownloadTier.next(storeDlTier)
+                    com.winlator.star.store.StoreDownloadTier.set(context, storeDlTier)
                 }
 
                 // Outlined rather than a filled button: the design keeps solid accent for switches

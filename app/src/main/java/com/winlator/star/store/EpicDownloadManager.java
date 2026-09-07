@@ -597,7 +597,7 @@ public class EpicDownloadManager {
             // (Fast = window 32, decompress = cores/2) instead of the Java pool's fixed 8; the
             // adapter splits the window across the distinct CDNs (per_host_cap). The Java
             // fallback pool below keeps its own fixed counts.
-            DownloadSpeedConfig cfg = new DownloadSpeedConfig(DownloadSpeedConfig.DEFAULT_TIER);
+            DownloadSpeedConfig cfg = StoreDownloadTier.config(ctx);
             final int rustWorkers = Math.max(1, Math.min(128, cfg.getMaxNetworkWindow()));
             final int rustProcess = Math.max(2, Math.max(1, Math.min(32, cfg.getMaxDecompress())));
             com.winlator.star.store.blsteam.BlEpicDownload.Result res =
