@@ -1,5 +1,11 @@
 # Star-Compose — Progress Log
 
+## 2026-09-06 — 🗂️ **Issue-tracker triage: 28 → 6 open** (+ #471 VEGAS forensics, + binder mixed-mode finding)
+> Closed with short replies: game-specific → community (#477 #407 #465 #464 #467 #424 #425 #415 #478), Mali → report board (#453), VEGAS → isygold + Mali link (#471), chatter/no-info (#472 #434 #435 #459 #470 #427 #479), fixed (#410 → dc8e5fb6; #431 + #475 → `00ef3a07`, user-confirmed).
+> - **#471 device forensics (root bridge, pubg build):** VEGAS 1.11.1 Sarek install SUCCEEDED (`contents/VEGAS/vegas-1.11.1-60383b1-1783652018/` complete 22:25:28); the sheet has no Installed marker so a re-tap 11 s later re-downloaded, re-extracted, and hit `ERROR_EXIST` → generic "Install failed". Package itself verified good (same layout as 1.11.2). UX fix (installed checkmark + "already installed" wording) NOT built. Screenshots parked at `docs/issue-attachments/471/` (`d7db7f93`).
+> - **Controller binder (Discord report):** binding ANY physical button flips the pad to remapped mode; unbound buttons are NOT native and go silent (`WinHandler.sendGamepadState` ~:1188 writes `remappedState` only). Shipped workaround = orange banner "Fill → native" (`VisualControllerBinder.kt` ~:190). User: wait, no engine change.
+> - Still open: #469 #426 #451 #446 #452 #433.
+
 ## 2026-09-06 — ✅ **#431 + #475 MERGED to main `00ef3a07`** (revert `git revert -m 1 00ef3a07`) — user-confirmed on device, both issues replied + closed
 > Build `fix-431-475-r1` (run `34070719965`, sha `73ea0694…`) tested by the user: Relative Mouse survives relaunch per game; file-manager grid rows level. Merge file list verified = `XServerDisplayActivity.java`, `FileManagerScreen.kt`, `PROGRESS_LOG.md` only. Next release notes: credit **@sandzmi5** (#431) and **@Devaspe** (#475).
 
