@@ -34,14 +34,22 @@ pub struct FetchOptions {
     pub max_workers: usize,         // window ceiling (tier); clamped to hosts × per_host_cap and 256
     pub per_host_cap: usize,        // 6 unless the store needs otherwise
     pub timeout: std::time::Duration,
-    pub headers: Vec<(String, String)>, // sent on every request (validated at client build)
+    pub headers: Vec<(String, String)>, // set on EVERY request builder (override client defaults, e.g. User-Agent)
     pub ca_bundle_path: String,     // "" = platform roots
     pub process_workers: usize,     // sync process-pool threads
     pub label: String,              // log prefix, e.g. "epic app=Fortnite"
+    pub stream: bool,               // false = whole-body → process(); true = pieces → on_chunk()/on_finish()
 }
+impl Default for FetchOptions { … }   // 8 / 6 / 60 s / no headers / "" / 2 / "" / false
 pub enum SinkError { Retry(String), Fatal(String) }
 pub trait FetchSink: Send + Sync {
+    /// Whole-body mode. Returns bytes to credit to progress.
     fn process(&self, item: &FetchItem, body: Vec<u8>) -> Result<u64, SinkError>;
+    /// Stream mode: in-order piece; offset == 0 marks the (re)start of an attempt → truncate.
+    /// Each accepted piece credits data.len(). Default impl = Fatal("streaming not supported").
+    fn on_chunk(&self, item: &FetchItem, offset: u64, data: &[u8]) -> Result<(), SinkError> { … }
+    /// Stream mode: body ended after total_len bytes; finalize. Returns EXTRA bytes to credit (0 = none).
+    fn on_finish(&self, item: &FetchItem, total_len: u64) -> Result<u64, SinkError> { … }
 }
 pub struct FetchOutcome { pub bytes_credited: u64, pub error: Option<String>, pub cancelled: bool, pub items_ok: u64 }
 pub fn run_fetch(
@@ -60,7 +68,9 @@ Semantics:
 - `run_fetch` is BLOCKING: it spawns its own current-thread tokio runtime (fetch driver) plus
   `process_workers` std threads (process pool) and returns when every item is processed, `cancel`
   is observed, or the first fatal error is recorded.
-- A request is `GET url` with `opts.headers`, plus `Range: bytes=a-b` when `item.range` is set.
+- A request is `GET url` with `opts.headers` applied on the request builder (so they override the
+  client-level defaults — Amazon's `User-Agent: nile/0.1 Amazon` beats the Steam UA, GOG's
+  `Authorization: Bearer …` rides along), plus `Range: bytes=a-b` when `item.range` is set.
   Accepted statuses: 200, and 206 when a range was requested. A range body must be exactly
   `b-a+1` bytes; otherwise the body must match `Content-Length` when the server sent one.
   Failures are classified like the Steam client (429 → rate-limited, 5xx → server fault, timeout,
@@ -78,7 +88,21 @@ Semantics:
 - The adapter is responsible for resume/skip: `items` must already exclude items that are present
   and verified, computed exactly the way the Java manager does.
 - `hosts` are distinct host keys (strings). They drive the per-host cap semaphores and the window
-  ceiling (`hosts.len() × per_host_cap`); `urls[host_idx]` is the URL to use on that host.
+  ceiling (`hosts.len() × opts.per_host_cap`, honoured as passed: 1 host × cap 8 = ceiling 8);
+  `urls[host_idx]` is the URL to use on that host.
+- **Stream mode** (`opts.stream = true`, applies to every item of the run): the driver reads the
+  response with `chunk()` and forwards pieces IN ORDER to the item's pool worker (an item's
+  pieces always go to the same worker: `idx % process_workers`), which calls `on_chunk`, then
+  `on_finish` when the body ends. Memory = pieces buffered-but-not-yet-written: each piece is
+  added to the in-flight budget when it arrives and released when the pool consumes it, and a
+  stream pauses reading while the budget is full — so 8 concurrent multi-GB streams stay bounded
+  by the same budget. `timeout` is the response-headers deadline and then an IDLE deadline per
+  piece (not a whole-transfer deadline). A failure mid-stream (network error, or `Retry` from
+  `on_chunk`/`on_finish`) retries the WHOLE item on another host: the remaining pieces of the
+  rejected attempt are dropped before they reach the sink, and the next attempt starts again at
+  `offset == 0` (the sink truncates its `.tmp`). `progress` fires after every written piece and
+  after `on_finish`; `bytes_credited` counts pieces as written (pieces of an attempt that later
+  failed stay counted) plus `on_finish` extras.
 
 Also on the core: `md5_small.rs` (`md5(&[u8]) -> [u8; 16]`, streaming `Md5 { update, finalize }`,
 `md5_hex`, RFC 1321 vectors as tests) for GOG, and `store_dl/mod.rs` declaring
@@ -123,7 +147,7 @@ Every line goes through the `log` callback (JNI → `android.util.Log` tag `BL_<
 manager's debug file). The adapter prints `engine=rust` first; the core prints:
 
 ```
-fetch-start label=<label> items=<n> bytes_reserved=<b> hosts=<h> ceiling=<max> budget=<MiB>MiB tier_max=<t> per_host_cap=<c> distinct_hosts=<d> window=<bootstrap>
+fetch-start label=<label> items=<n> bytes_reserved=<b> hosts=<h> ceiling=<max> budget=<MiB>MiB tier_max=<t> per_host_cap=<c> distinct_hosts=<d> window=<bootstrap> mode=body|stream
 fetch-window label=<label> window=<w> (min=<m> max=<M>) in_flight=<i> last=<x>MB/s ewma=<x>MB/s best=<x>MB/s reason=<code> cooldown=<ms>ms err_rate=<p>% phase=slow-start|steady rtt=<ms>ms budget_stalls=<n> host_stalls=<n>
 throughput label=<label> overall=<x>MB/s total=<x>MB elapsed=<s>s used=<x>/<y> servers: [host x.xMB/s xMB] …      (every 5 s)
 fetch-end label=<label> items_ok=<n> bytes=<wire> credited=<sink> elapsed_ms=<ms> avg_mbps=<x> peak_mbps=<x> result=ok|cancelled|error [error=<msg>]
@@ -143,4 +167,5 @@ the run was shorter than one sample). Reason codes: `start`, `grow:slow-start`,
 selection, range validation, scheduler ranking/cooldown, window shrink rules, the MD5 vectors, and
 an end-to-end `run_fetch` against a local `TcpListener` HTTP stub (plain bodies, a 206 range, a
 503-then-200 host, a sink `Retry`, a default header echoed back, give-up after 5 attempts, and
-cancel).
+cancel) plus a stream-mode run (300 KB body in ordered pieces, a range, a mid-stream `Retry`, a
+per-request `User-Agent` override echoed back, per_host_cap 8 honoured).

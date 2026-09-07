@@ -17,7 +17,7 @@
 //!
 //! Log grammar (all lines go through the `log` callback; `label` is adapter-chosen, e.g.
 //! `epic app=Fortnite`):
-//! - `fetch-start label=… items=… bytes_reserved=… hosts=… ceiling=… budget=…MiB tier_max=… per_host_cap=… window=…`
+//! - `fetch-start label=… items=… bytes_reserved=… hosts=… ceiling=… budget=…MiB tier_max=… per_host_cap=… distinct_hosts=… window=… mode=body|stream`
 //! - `fetch-window label=… window=N (min=… max=…) in_flight=… last=…MB/s ewma=…MB/s best=…MB/s reason=… cooldown=…ms err_rate=…% phase=… rtt=…ms budget_stalls=… host_stalls=…`
 //!   (same fields as the Steam engine's `fetch-window depot=…` line, so the two are A/B-comparable)
 //! - `throughput label=… overall=…MB/s total=…MB elapsed=…s used=x/y servers: [host …MB/s …MB] …` every 5 s
@@ -37,9 +37,9 @@ use crate::depot_writer::{
 };
 use futures_util::stream::FuturesUnordered;
 use futures_util::StreamExt;
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use std::fs;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::{mpsc as std_mpsc, Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -64,7 +64,8 @@ pub struct FetchItem {
     /// `len == hosts.len()` → `urls[host_idx]`; `len == 1` → the same URL on every host. Any other
     /// non-zero length falls back to `urls.get(host_idx)` then `urls[0]`. Empty = fatal.
     pub urls: Vec<String>,
-    /// Expected RAW (wire) bytes, for the in-flight byte budget; `0` → nominal 1 MiB.
+    /// Expected RAW (wire) bytes, for the in-flight byte budget; `0` → nominal 1 MiB. Ignored in
+    /// stream mode (streams are budgeted piece by piece as they arrive).
     pub reserve: u64,
     /// Inclusive HTTP `Range` (`bytes=a-b`); `None` = whole body.
     pub range: Option<(u64, u64)>,
@@ -74,11 +75,15 @@ pub struct FetchItem {
 pub struct FetchOptions {
     /// Window ceiling (tier); the core clamps it to `hosts × per_host_cap` and the hard cap.
     pub max_workers: usize,
-    /// Max concurrent requests per distinct host (6 unless the store needs otherwise).
+    /// Max concurrent requests per distinct host (6 unless the store needs otherwise). Honoured
+    /// as given: 1 host × `per_host_cap` 8 = a ceiling of 8.
     pub per_host_cap: usize,
-    /// Per-request timeout (connect + headers + body).
+    /// Whole-body mode: the deadline for the entire request (connect + headers + body). Stream
+    /// mode: the deadline for the response headers, then an IDLE deadline per received piece.
     pub timeout: Duration,
-    /// Sent on every request (e.g. `("Authorization", "Bearer …")`). Validated at client build.
+    /// Sent on EVERY request (applied on the request builder, so they override the client-level
+    /// defaults — e.g. a store's own `User-Agent`, or `Authorization: Bearer …`). Validated once
+    /// when the client is built.
     pub headers: Vec<(String, String)>,
     /// PEM bundle path; `""` = the platform roots reqwest/rustls ships with.
     pub ca_bundle_path: String,
@@ -86,27 +91,70 @@ pub struct FetchOptions {
     pub process_workers: usize,
     /// Log prefix, e.g. `"epic app=Fortnite"`.
     pub label: String,
+    /// `false` (default): each item's whole body is buffered and handed to
+    /// [`FetchSink::process`]. `true`: the body is streamed — pieces go to
+    /// [`FetchSink::on_chunk`] in order as they arrive, then [`FetchSink::on_finish`]; for
+    /// multi-GB files (Amazon) that keeps memory at "pieces not yet written", not whole files.
+    /// Applies to every item of the run.
+    pub stream: bool,
+}
+
+impl Default for FetchOptions {
+    fn default() -> Self {
+        Self {
+            max_workers: BOOTSTRAP_WINDOW,
+            per_host_cap: crate::depot_writer::PER_HOST_CAP,
+            timeout: Duration::from_secs(60),
+            headers: Vec::new(),
+            ca_bundle_path: String::new(),
+            process_workers: 2,
+            label: String::new(),
+            stream: false,
+        }
+    }
 }
 
 /// What the sink says about a body it was handed.
 #[derive(Clone, Debug)]
 pub enum SinkError {
     /// Counts as a failed attempt for that item: host cooled + demoted, back-off, re-dispatch on a
-    /// different host, up to [`MAX_ITEM_ATTEMPTS`].
+    /// different host, up to [`MAX_ITEM_ATTEMPTS`]. In stream mode the whole item is re-streamed
+    /// (`on_chunk` sees `offset == 0` again).
     Retry(String),
     /// Abort the whole run; this becomes the run's first error.
     Fatal(String),
 }
 
-/// Runs on a process-pool thread with the raw wire body. Do inflate + hash verify + write here.
-/// Returns the number of bytes to credit to progress (adapter's choice, e.g. decompressed bytes).
+/// Runs on a process-pool thread. Whole-body mode uses [`FetchSink::process`]; stream mode uses
+/// [`FetchSink::on_chunk`] + [`FetchSink::on_finish`] (default impls refuse, so a whole-body sink
+/// is unaffected by the stream option existing).
 pub trait FetchSink: Send + Sync {
+    /// Whole-body mode: the raw wire body. Do inflate + hash verify + write here. Returns the
+    /// number of bytes to credit to progress (adapter's choice, e.g. decompressed bytes).
     fn process(&self, item: &FetchItem, body: Vec<u8>) -> Result<u64, SinkError>;
+
+    /// Stream mode: one piece of the body, delivered in order (`offset` = bytes of this attempt
+    /// delivered before this piece). `offset == 0` marks the (re)start of an attempt — truncate any
+    /// partial output from a previous attempt. Each processed piece credits `data.len()` bytes.
+    fn on_chunk(&self, item: &FetchItem, offset: u64, data: &[u8]) -> Result<(), SinkError> {
+        let _ = (item, offset, data);
+        Err(SinkError::Fatal("streaming not supported by this sink".to_string()))
+    }
+
+    /// Stream mode: the body ended after `total_len` bytes. Finalize (rename `.tmp`, verify the
+    /// hash, …). Returns EXTRA bytes to credit (pieces were already credited as they were
+    /// written; return 0 for none).
+    fn on_finish(&self, item: &FetchItem, total_len: u64) -> Result<u64, SinkError> {
+        let _ = (item, total_len);
+        Err(SinkError::Fatal("streaming not supported by this sink".to_string()))
+    }
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct FetchOutcome {
-    /// Sum of what the sink returned for every successfully processed item.
+    /// Sum of what the sink returned for every successfully processed item (stream mode: every
+    /// piece written + every `on_finish` extra; pieces of an attempt that later failed stay
+    /// counted).
     pub bytes_credited: u64,
     /// First error (fetch after max attempts, sink `Fatal`, client build failure).
     pub error: Option<String>,
@@ -124,7 +172,8 @@ impl FetchOutcome {
 
 /// Blocking: spawns its own current-thread tokio runtime + process pool and returns when every
 /// item is processed, `cancel` is set, or the first fatal error is recorded. `progress` fires from
-/// a process-pool thread after each successful `process` (the caller throttles).
+/// a process-pool thread after each successful `process` / each written piece + `on_finish` (the
+/// caller throttles).
 pub fn run_fetch(
     items: Vec<FetchItem>,
     hosts: &[String],
@@ -136,6 +185,7 @@ pub fn run_fetch(
 ) -> FetchOutcome {
     let started = Instant::now();
     let label = opts.label.as_str();
+    let stream = opts.stream;
     let hosts: Vec<String> = if hosts.is_empty() {
         vec![String::from("default")]
     } else {
@@ -146,15 +196,17 @@ pub fn run_fetch(
     let (bootstrap, win_min, win_max) =
         window_bounds(opts.max_workers, distinct_hosts, per_host_cap);
     let budget = inflight_budget_bytes(win_max);
-    let bytes_reserved: u64 = items.iter().map(|i| reserve_bytes(i)).sum();
+    let bytes_reserved: u64 = items.iter().map(reserve_bytes).sum();
 
     log(&format!(
         "fetch-start label={label} items={} bytes_reserved={bytes_reserved} hosts={} ceiling={win_max} \
-budget={}MiB tier_max={} per_host_cap={per_host_cap} distinct_hosts={distinct_hosts} window={bootstrap}",
+budget={}MiB tier_max={} per_host_cap={per_host_cap} distinct_hosts={distinct_hosts} window={bootstrap} \
+mode={}",
         items.len(),
         hosts.len(),
         budget / (1024 * 1024),
         opts.max_workers,
+        if stream { "stream" } else { "body" },
     ));
 
     let bytes_credited = AtomicU64::new(0);
@@ -163,16 +215,35 @@ budget={}MiB tier_max={} per_host_cap={per_host_cap} distinct_hosts={distinct_ho
     let error_slot: Mutex<Option<String>> = Mutex::new(None);
     let reporter_done = AtomicBool::new(false);
     let meter = BandwidthMeter::new(&hosts);
+    // Stream mode: per-item "attempt N was rejected by the sink mid-stream" flags, so the driver's
+    // in-flight stream stops reading instead of feeding pieces nobody wants.
+    let abandon: Vec<AtomicU32> = if stream {
+        items.iter().map(|_| AtomicU32::new(NO_ATTEMPT)).collect()
+    } else {
+        Vec::new()
+    };
 
     let proc_count = opts.process_workers.max(1).min(items.len().max(1));
     let items = &items;
     let meter = &meter;
+    let abandon = &abandon;
 
     thread::scope(|scope| {
         // Async(fetch) → sync(process): tokio unbounded mpsc drained with `blocking_recv`. Memory is
-        // bounded by the RAW byte budget enforced at DISPATCH, not by channel capacity.
-        let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<ProcessMsg>();
-        let rx = Arc::new(Mutex::new(rx));
+        // bounded by the RAW byte budget enforced at DISPATCH (whole-body) / per piece (stream), not
+        // by channel capacity. Whole-body mode: ONE channel shared by every worker (any worker takes
+        // the next body). Stream mode: one channel PER worker and an item's pieces always go to the
+        // same worker (`idx % workers`), so pieces are written in order.
+        let channel_count = if stream { proc_count } else { 1 };
+        let mut txs: Vec<tokio::sync::mpsc::UnboundedSender<ProcessMsg>> =
+            Vec::with_capacity(channel_count);
+        let mut rxs: Vec<Arc<Mutex<tokio::sync::mpsc::UnboundedReceiver<ProcessMsg>>>> =
+            Vec::with_capacity(channel_count);
+        for _ in 0..channel_count {
+            let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<ProcessMsg>();
+            txs.push(tx);
+            rxs.push(Arc::new(Mutex::new(rx)));
+        }
         // Sync(process) → async(driver): sink verdicts, polled non-blocking by the driver.
         let (fb_tx, fb_rx) = std_mpsc::channel::<Feedback>();
         let bytes_credited = &bytes_credited;
@@ -201,70 +272,165 @@ budget={}MiB tier_max={} per_host_cap={per_host_cap} distinct_hosts={distinct_ho
 
         // ── Process pool ──
         let mut proc_handles = Vec::with_capacity(proc_count);
-        for _ in 0..proc_count {
-            let rx = Arc::clone(&rx);
+        for worker in 0..proc_count {
+            let rx = Arc::clone(&rxs[if stream { worker } else { 0 }]);
             let fb = fb_tx.clone();
-            proc_handles.push(scope.spawn(move || loop {
-                if cancel.load(Ordering::Relaxed) {
-                    return;
-                }
-                if error_slot.lock().expect("err slot poisoned").is_some() {
-                    return;
-                }
-                let msg = {
-                    let mut guard = rx.lock().expect("rx poisoned");
-                    guard.blocking_recv()
-                };
-                let Some(msg) = msg else {
-                    return;
-                };
-                let ProcessMsg {
-                    idx,
-                    attempts,
-                    server_idx,
-                    body,
-                } = msg;
-                let raw_len = body.len() as u64;
-                // A body that was already queued when cancel / the first error landed must not be
-                // written any more (keeps on-disk state as the caller expects after a cancel).
-                if cancel.load(Ordering::Relaxed)
-                    || error_slot.lock().expect("err slot poisoned").is_some()
-                {
-                    in_flight.fetch_sub(raw_len, Ordering::Relaxed);
-                    return;
-                }
-                let item = &items[idx];
-                let res = sink.process(item, body);
-                // Free the budget on PROCESS-COMPLETE (actual raw bytes), success or not.
-                in_flight.fetch_sub(raw_len, Ordering::Relaxed);
-                let verdict = match res {
-                    Ok(credited) => {
-                        let total = bytes_credited.fetch_add(credited, Ordering::Relaxed) + credited;
-                        let ok = items_ok.fetch_add(1, Ordering::Relaxed) + 1;
-                        progress(total, ok);
-                        SinkVerdict::Ok
+            proc_handles.push(scope.spawn(move || {
+                // Stream mode: (item → attempt, message) whose pieces the sink rejected; the rest
+                // of that attempt's pieces are dropped and its Finish becomes a Retry verdict.
+                let mut poisoned: HashMap<usize, (u32, String)> = HashMap::new();
+                loop {
+                    if cancel.load(Ordering::Relaxed) {
+                        return;
                     }
-                    Err(SinkError::Retry(message)) => SinkVerdict::Retry(message),
-                    Err(SinkError::Fatal(message)) => {
-                        record_first_error(
-                            error_slot,
-                            format!("{label}: item {} failed: {message}", item.id),
-                        );
-                        SinkVerdict::Fatal
+                    if error_slot.lock().expect("err slot poisoned").is_some() {
+                        return;
                     }
-                };
-                let _ = fb.send(Feedback {
-                    idx,
-                    attempts,
-                    server_idx,
-                    verdict,
-                });
+                    let msg = {
+                        let mut guard = rx.lock().expect("rx poisoned");
+                        guard.blocking_recv()
+                    };
+                    let Some(msg) = msg else {
+                        return;
+                    };
+                    match msg {
+                        ProcessMsg::Body {
+                            idx,
+                            attempts,
+                            server_idx,
+                            body,
+                        } => {
+                            let raw_len = body.len() as u64;
+                            // A body that was already queued when cancel / the first error landed
+                            // must not be written any more.
+                            if cancel.load(Ordering::Relaxed)
+                                || error_slot.lock().expect("err slot poisoned").is_some()
+                            {
+                                in_flight.fetch_sub(raw_len, Ordering::Relaxed);
+                                return;
+                            }
+                            let item = &items[idx];
+                            let res = sink.process(item, body);
+                            // Free the budget on PROCESS-COMPLETE (actual raw bytes).
+                            in_flight.fetch_sub(raw_len, Ordering::Relaxed);
+                            let verdict = match res {
+                                Ok(credited) => {
+                                    let total = bytes_credited
+                                        .fetch_add(credited, Ordering::Relaxed)
+                                        + credited;
+                                    let ok = items_ok.fetch_add(1, Ordering::Relaxed) + 1;
+                                    progress(total, ok);
+                                    SinkVerdict::Ok
+                                }
+                                Err(SinkError::Retry(message)) => SinkVerdict::Retry(message),
+                                Err(SinkError::Fatal(message)) => {
+                                    record_first_error(
+                                        error_slot,
+                                        format!("{label}: item {} failed: {message}", item.id),
+                                    );
+                                    SinkVerdict::Fatal
+                                }
+                            };
+                            let _ = fb.send(Feedback {
+                                idx,
+                                attempts,
+                                server_idx,
+                                verdict,
+                            });
+                        }
+                        ProcessMsg::Piece {
+                            idx,
+                            attempts,
+                            offset,
+                            data,
+                        } => {
+                            let len = data.len() as u64;
+                            in_flight.fetch_sub(len, Ordering::Relaxed);
+                            if poisoned.get(&idx).is_some_and(|(a, _)| *a == attempts) {
+                                continue; // rest of a rejected attempt
+                            }
+                            if cancel.load(Ordering::Relaxed)
+                                || error_slot.lock().expect("err slot poisoned").is_some()
+                            {
+                                return;
+                            }
+                            let item = &items[idx];
+                            match sink.on_chunk(item, offset, &data) {
+                                Ok(()) => {
+                                    let total =
+                                        bytes_credited.fetch_add(len, Ordering::Relaxed) + len;
+                                    progress(total, items_ok.load(Ordering::Relaxed));
+                                }
+                                Err(SinkError::Retry(message)) => {
+                                    poisoned.insert(idx, (attempts, message));
+                                    if let Some(flag) = abandon.get(idx) {
+                                        flag.store(attempts, Ordering::Relaxed);
+                                    }
+                                }
+                                Err(SinkError::Fatal(message)) => {
+                                    record_first_error(
+                                        error_slot,
+                                        format!("{label}: item {} failed: {message}", item.id),
+                                    );
+                                    if let Some(flag) = abandon.get(idx) {
+                                        flag.store(attempts, Ordering::Relaxed);
+                                    }
+                                    return;
+                                }
+                            }
+                        }
+                        ProcessMsg::Finish {
+                            idx,
+                            attempts,
+                            server_idx,
+                            total_len,
+                        } => {
+                            let item = &items[idx];
+                            let verdict = if poisoned
+                                .get(&idx)
+                                .is_some_and(|(a, _)| *a == attempts)
+                            {
+                                let (_, message) = poisoned.remove(&idx).expect("poisoned");
+                                SinkVerdict::Retry(message)
+                            } else {
+                                match sink.on_finish(item, total_len) {
+                                    Ok(extra) => {
+                                        let total = bytes_credited
+                                            .fetch_add(extra, Ordering::Relaxed)
+                                            + extra;
+                                        let ok = items_ok.fetch_add(1, Ordering::Relaxed) + 1;
+                                        progress(total, ok);
+                                        SinkVerdict::Ok
+                                    }
+                                    Err(SinkError::Retry(message)) => SinkVerdict::Retry(message),
+                                    Err(SinkError::Fatal(message)) => {
+                                        record_first_error(
+                                            error_slot,
+                                            format!(
+                                                "{label}: item {} failed: {message}",
+                                                item.id
+                                            ),
+                                        );
+                                        SinkVerdict::Fatal
+                                    }
+                                }
+                            };
+                            let _ = fb.send(Feedback {
+                                idx,
+                                attempts,
+                                server_idx,
+                                verdict,
+                            });
+                        }
+                    }
+                }
             }));
         }
         drop(fb_tx);
 
-        // ── Async fetch driver on one current-thread runtime. `tx` is moved in and dropped when the
-        // driver returns, which closes the channel so the pool's `blocking_recv` yields `None`. ──
+        // ── Async fetch driver on one current-thread runtime. `txs` are moved in and dropped when
+        // the driver returns, which closes the channels so the pool's `blocking_recv` yields
+        // `None`. ──
         match tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
@@ -280,7 +446,8 @@ budget={}MiB tier_max={} per_host_cap={per_host_cap} distinct_hosts={distinct_ho
                     meter,
                     in_flight,
                     error_slot,
-                    tx,
+                    abandon: abandon.as_slice(),
+                    txs,
                     fb_rx,
                     budget,
                     bootstrap,
@@ -291,7 +458,7 @@ budget={}MiB tier_max={} per_host_cap={per_host_cap} distinct_hosts={distinct_ho
             }
             Err(err) => {
                 record_first_error(error_slot, format!("{label}: tokio runtime: {err}"));
-                drop(tx);
+                drop(txs);
             }
         }
 
@@ -465,24 +632,29 @@ fn record_first_error(slot: &Mutex<Option<String>>, err: String) {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────────────────────
-// HTTP client (mirrors `AsyncCdnClient` + per-run headers + optional Range)
+// HTTP client (mirrors `AsyncCdnClient` + per-request headers + optional Range + streaming)
 // ─────────────────────────────────────────────────────────────────────────────────────────────
 
-fn build_client(opts: &FetchOptions, pool_max_idle_per_host: usize) -> Result<reqwest::Client, String> {
-    let mut default_headers = reqwest::header::HeaderMap::new();
+/// The pooled client plus the pre-validated per-request headers.
+struct Http {
+    client: reqwest::Client,
+    headers: Vec<(reqwest::header::HeaderName, reqwest::header::HeaderValue)>,
+}
+
+fn build_http(opts: &FetchOptions, pool_max_idle_per_host: usize) -> Result<Http, String> {
+    let mut headers = Vec::with_capacity(opts.headers.len());
     for (name, value) in &opts.headers {
-        let name = reqwest::header::HeaderName::from_bytes(name.as_bytes())
+        let hname = reqwest::header::HeaderName::from_bytes(name.as_bytes())
             .map_err(|err| format!("bad header name '{name}': {err}"))?;
-        let value = reqwest::header::HeaderValue::from_str(value)
+        let hvalue = reqwest::header::HeaderValue::from_str(value)
             .map_err(|err| format!("bad header value for '{name}': {err}"))?;
-        default_headers.append(name, value);
+        headers.push((hname, hvalue));
     }
     let mut builder = reqwest::Client::builder()
         .user_agent(USER_AGENT)
         .connect_timeout(CdnClient::connect_timeout())
         .pool_max_idle_per_host(pool_max_idle_per_host.max(1))
-        .pool_idle_timeout(Duration::from_secs(90))
-        .default_headers(default_headers);
+        .pool_idle_timeout(Duration::from_secs(90));
     if !opts.ca_bundle_path.is_empty() {
         let pem = fs::read(&opts.ca_bundle_path).map_err(|err| format!("read CA bundle: {err}"))?;
         let certs = reqwest::Certificate::from_pem_bundle(&pem)
@@ -491,33 +663,52 @@ fn build_client(opts: &FetchOptions, pool_max_idle_per_host: usize) -> Result<re
             builder = builder.add_root_certificate(cert);
         }
     }
-    builder.build().map_err(|err| format!("http client: {err}"))
+    let client = builder.build().map_err(|err| format!("http client: {err}"))?;
+    Ok(Http { client, headers })
 }
 
-/// One attempt for one item (the driver owns retry/rotation).
-async fn fetch_once(
-    client: &reqwest::Client,
+impl Http {
+    /// `GET url` with the run's headers (set per request, so they override the client defaults —
+    /// a store's own `User-Agent` wins over the Steam one) and the optional `Range`.
+    fn request(&self, url: &str, range: Option<(u64, u64)>) -> reqwest::RequestBuilder {
+        let mut request = self.client.get(url);
+        for (name, value) in &self.headers {
+            request = request.header(name.clone(), value.clone());
+        }
+        if let Some((a, b)) = range {
+            request = request.header(reqwest::header::RANGE, format!("bytes={a}-{b}"));
+        }
+        request
+    }
+}
+
+fn classify_reqwest_error(err: &reqwest::Error) -> FetchFailKind {
+    if err.is_timeout() {
+        FetchFailKind::Timeout
+    } else if err.is_connect() {
+        FetchFailKind::Connect
+    } else {
+        FetchFailKind::Other
+    }
+}
+
+/// Sends the request and checks the status; shared by both modes.
+async fn send_checked(
+    http: &Http,
     url: &str,
     range: Option<(u64, u64)>,
-    timeout: Duration,
-) -> Result<Vec<u8>, AsyncFetchError> {
-    let mut request = client.get(url).timeout(timeout);
-    if let Some((a, b)) = range {
-        request = request.header(reqwest::header::RANGE, format!("bytes={a}-{b}"));
+    timeout: Option<Duration>,
+) -> Result<reqwest::Response, AsyncFetchError> {
+    let mut request = http.request(url, range);
+    if let Some(timeout) = timeout {
+        request = request.timeout(timeout);
     }
     let response = match request.send().await {
         Ok(response) => response,
         Err(err) => {
-            let kind = if err.is_timeout() {
-                FetchFailKind::Timeout
-            } else if err.is_connect() {
-                FetchFailKind::Connect
-            } else {
-                FetchFailKind::Other
-            };
             return Err(AsyncFetchError {
                 message: format!("http get: {err}"),
-                kind,
+                kind: classify_reqwest_error(&err),
             });
         }
     };
@@ -528,6 +719,17 @@ async fn fetch_once(
             kind: classify_status(status),
         });
     }
+    Ok(response)
+}
+
+/// Whole-body mode: one attempt for one item (the driver owns retry/rotation).
+async fn fetch_once(
+    http: &Http,
+    url: &str,
+    range: Option<(u64, u64)>,
+    timeout: Duration,
+) -> Result<Vec<u8>, AsyncFetchError> {
+    let response = send_checked(http, url, range, Some(timeout)).await?;
     let content_length = response.content_length();
     let body = match response.bytes().await {
         Ok(body) => body.to_vec(),
@@ -547,15 +749,125 @@ async fn fetch_once(
     Ok(body)
 }
 
+/// Stream mode: one attempt for one item. Pieces are pushed to the item's pool worker as they
+/// arrive (each one added to the in-flight budget until the pool consumes it); the future waits
+/// while the budget is full, and stops early on cancel or when the sink rejected this attempt.
+/// Returns the total body length after the last piece was queued.
+#[allow(clippy::too_many_arguments)]
+async fn fetch_stream(
+    http: &Http,
+    url: &str,
+    range: Option<(u64, u64)>,
+    timeout: Duration,
+    idx: usize,
+    attempts: u32,
+    tx: &tokio::sync::mpsc::UnboundedSender<ProcessMsg>,
+    in_flight: &AtomicU64,
+    budget: u64,
+    cancel: &AtomicBool,
+    abandon: Option<&AtomicU32>,
+) -> Result<u64, AsyncFetchError> {
+    let mut response =
+        match tokio::time::timeout(timeout, send_checked(http, url, range, None)).await {
+            Ok(res) => res?,
+            Err(_) => {
+                return Err(AsyncFetchError {
+                    message: "http get: response headers timed out".to_string(),
+                    kind: FetchFailKind::Timeout,
+                })
+            }
+        };
+    let content_length = response.content_length();
+    let mut offset = 0u64;
+    loop {
+        // Budget gate: don't read ahead of the pool by more than the budget.
+        while in_flight.load(Ordering::Relaxed) >= budget {
+            if cancel.load(Ordering::Relaxed) {
+                return Err(AsyncFetchError {
+                    message: "cancelled".to_string(),
+                    kind: FetchFailKind::Other,
+                });
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        if abandon.is_some_and(|f| f.load(Ordering::Relaxed) == attempts) {
+            return Err(AsyncFetchError {
+                message: "sink rejected a piece of this attempt".to_string(),
+                kind: FetchFailKind::Other,
+            });
+        }
+        let piece = match tokio::time::timeout(timeout, response.chunk()).await {
+            Ok(Ok(Some(piece))) => piece,
+            Ok(Ok(None)) => break,
+            Ok(Err(err)) => {
+                return Err(AsyncFetchError {
+                    message: format!("http body: {err}"),
+                    kind: classify_reqwest_error(&err),
+                });
+            }
+            Err(_) => {
+                return Err(AsyncFetchError {
+                    message: format!("http body: idle timeout at offset {offset}"),
+                    kind: FetchFailKind::Timeout,
+                });
+            }
+        };
+        if piece.is_empty() {
+            continue;
+        }
+        let data = piece.to_vec();
+        let len = data.len() as u64;
+        in_flight.fetch_add(len, Ordering::Relaxed);
+        if tx
+            .send(ProcessMsg::Piece {
+                idx,
+                attempts,
+                offset,
+                data,
+            })
+            .is_err()
+        {
+            in_flight.fetch_sub(len, Ordering::Relaxed);
+            return Err(AsyncFetchError {
+                message: "process pool gone".to_string(),
+                kind: FetchFailKind::Other,
+            });
+        }
+        offset += len;
+    }
+    validate_body_len(offset, content_length, range)?;
+    Ok(offset)
+}
+
 // ─────────────────────────────────────────────────────────────────────────────────────────────
 // Driver plumbing
 // ─────────────────────────────────────────────────────────────────────────────────────────────
 
-struct ProcessMsg {
-    idx: usize,
-    attempts: u32,
-    server_idx: usize,
-    body: Vec<u8>,
+/// `abandon` sentinel: no attempt of this item has been rejected by the sink.
+const NO_ATTEMPT: u32 = u32::MAX;
+
+enum ProcessMsg {
+    /// Whole-body mode: the complete raw body.
+    Body {
+        idx: usize,
+        attempts: u32,
+        server_idx: usize,
+        body: Vec<u8>,
+    },
+    /// Stream mode: one in-order piece of attempt `attempts` of item `idx`.
+    Piece {
+        idx: usize,
+        attempts: u32,
+        offset: u64,
+        data: Vec<u8>,
+    },
+    /// Stream mode: the body ended; the pool finalizes and reports a verdict.
+    Finish {
+        idx: usize,
+        attempts: u32,
+        server_idx: usize,
+        total_len: u64,
+    },
 }
 
 enum SinkVerdict {
@@ -579,6 +891,11 @@ struct PendingItem {
     not_before: Instant,
 }
 
+enum Fetched {
+    Body(Vec<u8>),
+    Streamed(u64),
+}
+
 /// The result the driver awaits for each dispatched fetch.
 struct FetchDone {
     idx: usize,
@@ -586,7 +903,7 @@ struct FetchDone {
     reserve: u64,
     server_idx: usize,
     elapsed: Duration,
-    res: Result<Vec<u8>, AsyncFetchError>,
+    res: Result<Fetched, AsyncFetchError>,
 }
 
 struct DriverCtx<'a> {
@@ -599,7 +916,8 @@ struct DriverCtx<'a> {
     meter: &'a BandwidthMeter,
     in_flight: &'a AtomicU64,
     error_slot: &'a Mutex<Option<String>>,
-    tx: tokio::sync::mpsc::UnboundedSender<ProcessMsg>,
+    abandon: &'a [AtomicU32],
+    txs: Vec<tokio::sync::mpsc::UnboundedSender<ProcessMsg>>,
     fb_rx: std_mpsc::Receiver<Feedback>,
     budget: u64,
     bootstrap: usize,
@@ -619,7 +937,8 @@ async fn run_driver(ctx: DriverCtx<'_>) {
         meter,
         in_flight,
         error_slot,
-        tx,
+        abandon,
+        txs,
         fb_rx,
         budget,
         bootstrap,
@@ -628,23 +947,25 @@ async fn run_driver(ctx: DriverCtx<'_>) {
         per_host_cap,
     } = ctx;
     let timeout = opts.timeout;
+    let stream = opts.stream;
 
-    let client = match build_client(opts, per_host_cap) {
-        Ok(client) => client,
+    let http = match build_http(opts, per_host_cap) {
+        Ok(http) => http,
         Err(err) => {
             record_first_error(error_slot, format!("{label}: {err}"));
-            drop(tx);
+            drop(txs);
             return;
         }
     };
 
     let mut window = AdaptiveWindow::new(bootstrap, win_min, win_max, Instant::now());
     let mut sched = FetchScheduler::new(hosts, per_host_cap);
-    let mut inflight: FuturesUnordered<_> = FuturesUnordered::new();
     let mut retry: VecDeque<PendingItem> = VecDeque::new();
     let mut next_item = 0usize;
-    // Bodies handed to the pool whose verdict has not come back yet.
+    // Bodies / finishes handed to the pool whose verdict has not come back yet.
     let mut outstanding = 0usize;
+    // Declared AFTER `txs`/`http` so it is dropped BEFORE them (its futures borrow both).
+    let mut inflight: FuturesUnordered<_> = FuturesUnordered::new();
 
     'outer: loop {
         if cancel.load(Ordering::Relaxed)
@@ -713,8 +1034,9 @@ async fn run_driver(ctx: DriverCtx<'_>) {
             let item = &items[idx];
 
             // Byte-budget gate (hard memory bound): reserve at DISPATCH. Always admits when nothing
-            // is in flight, so an item bigger than the whole budget can't deadlock.
-            let reserve = reserve_bytes(item);
+            // is in flight, so an item bigger than the whole budget can't deadlock. Streams reserve
+            // nothing here — their pieces are budgeted as they arrive.
+            let reserve = if stream { 0 } else { reserve_bytes(item) };
             if !budget_admits(in_flight.load(Ordering::Relaxed), reserve, budget) {
                 window.note_budget_stall();
                 break; // wait for a completion to free budget
@@ -747,10 +1069,32 @@ async fn run_driver(ctx: DriverCtx<'_>) {
                 next_item += 1;
             }
             in_flight.fetch_add(reserve, Ordering::Relaxed);
-            let client = &client;
+            let http = &http;
+            let tx = &txs[if stream { idx % txs.len() } else { 0 }];
+            let abandon_flag = abandon.get(idx);
             let started = Instant::now();
             inflight.push(async move {
-                let res = fetch_once(client, &url, range, timeout).await;
+                let res = if stream {
+                    fetch_stream(
+                        http,
+                        &url,
+                        range,
+                        timeout,
+                        idx,
+                        attempts + 1,
+                        tx,
+                        in_flight,
+                        budget,
+                        cancel,
+                        abandon_flag,
+                    )
+                    .await
+                    .map(Fetched::Streamed)
+                } else {
+                    fetch_once(http, &url, range, timeout)
+                        .await
+                        .map(Fetched::Body)
+                };
                 drop(permit); // RAII per-host permit release (also on future drop / cancel-abort)
                 FetchDone {
                     idx,
@@ -783,7 +1127,7 @@ async fn run_driver(ctx: DriverCtx<'_>) {
         };
         let now = Instant::now();
         match done.res {
-            Ok(body) => {
+            Ok(Fetched::Body(body)) => {
                 let raw_len = body.len() as u64;
                 meter.record(done.server_idx, raw_len);
                 sched.on_success(done.server_idx, raw_len, done.elapsed);
@@ -796,12 +1140,29 @@ async fn run_driver(ctx: DriverCtx<'_>) {
                     in_flight.fetch_sub(done.reserve - raw_len, Ordering::Relaxed);
                 }
                 outstanding += 1;
-                if tx
-                    .send(ProcessMsg {
+                if txs[0]
+                    .send(ProcessMsg::Body {
                         idx: done.idx,
                         attempts: done.attempts,
                         server_idx: done.server_idx,
                         body,
+                    })
+                    .is_err()
+                {
+                    break; // process side gone
+                }
+            }
+            Ok(Fetched::Streamed(total_len)) => {
+                meter.record(done.server_idx, total_len);
+                sched.on_success(done.server_idx, total_len, done.elapsed);
+                window.record_ok(done.elapsed.as_secs_f64() * 1000.0);
+                outstanding += 1;
+                if txs[done.idx % txs.len()]
+                    .send(ProcessMsg::Finish {
+                        idx: done.idx,
+                        attempts: done.attempts,
+                        server_idx: done.server_idx,
+                        total_len,
                     })
                     .is_err()
                 {
@@ -835,10 +1196,10 @@ async fn run_driver(ctx: DriverCtx<'_>) {
         }
     }
 
-    // Close the channel so the process pool drains and exits; dropping `inflight` aborts any
-    // still-running requests (the cancel / error / final-failure teardown path).
-    drop(tx);
+    // Dropping `inflight` aborts any still-running requests (the cancel / error / final-failure
+    // teardown path); dropping the senders then closes the channels so the pool drains and exits.
     drop(inflight);
+    drop(txs);
 }
 
 // ─────────────────────────────────────────────────────────────────────────────────────────────
@@ -1495,6 +1856,7 @@ mod tests {
                     let path = request.split(' ').nth(1).unwrap_or("/").to_string();
                     let mut range: Option<(u64, u64)> = None;
                     let mut auth = String::new();
+                    let mut ua = String::new();
                     for line in lines {
                         let lower = line.to_ascii_lowercase();
                         if let Some(v) = lower.strip_prefix("range: bytes=") {
@@ -1509,6 +1871,10 @@ mod tests {
                             auth = v.trim().to_string();
                         } else if let Some(v) = line.strip_prefix("authorization: ") {
                             auth = v.trim().to_string();
+                        } else if let Some(v) = line.strip_prefix("User-Agent: ") {
+                            ua = v.trim().to_string();
+                        } else if let Some(v) = line.strip_prefix("user-agent: ") {
+                            ua = v.trim().to_string();
                         }
                     }
                     let count = {
@@ -1517,8 +1883,8 @@ mod tests {
                         *c += 1;
                         *c
                     };
-                    let response: Vec<u8> = if path == "/auth" {
-                        let body = auth.into_bytes();
+                    let response: Vec<u8> = if path == "/auth" || path == "/ua" {
+                        let body = if path == "/auth" { auth } else { ua }.into_bytes();
                         let mut r = format!(
                             "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
                             body.len()
@@ -1591,7 +1957,110 @@ mod tests {
             ca_bundle_path: String::new(),
             process_workers: 2,
             label: label.to_string(),
+            stream: false,
         }
+    }
+
+    /// Stream-mode sink: appends pieces per item (offset 0 restarts), finalizes by length check.
+    struct StreamSink {
+        got: Mutex<HashMap<u64, Vec<u8>>>,
+        finished: Mutex<HashMap<u64, u64>>,
+        /// Reject the first piece of this item once (exercises the mid-stream Retry path).
+        retry_once_id: Option<u64>,
+        retried: AtomicUsize,
+    }
+
+    impl FetchSink for StreamSink {
+        fn process(&self, _item: &FetchItem, _body: Vec<u8>) -> Result<u64, SinkError> {
+            Err(SinkError::Fatal("whole-body mode not expected".into()))
+        }
+
+        fn on_chunk(&self, item: &FetchItem, offset: u64, data: &[u8]) -> Result<(), SinkError> {
+            let mut got = self.got.lock().unwrap();
+            let buf = got.entry(item.id).or_default();
+            if offset == 0 {
+                buf.clear();
+                if self.retry_once_id == Some(item.id)
+                    && self.retried.fetch_add(1, Ordering::SeqCst) == 0
+                {
+                    return Err(SinkError::Retry("simulated bad first piece".into()));
+                }
+            }
+            assert_eq!(buf.len() as u64, offset, "pieces must arrive in order");
+            buf.extend_from_slice(data);
+            Ok(())
+        }
+
+        fn on_finish(&self, item: &FetchItem, total_len: u64) -> Result<u64, SinkError> {
+            let got = self.got.lock().unwrap();
+            let len = got.get(&item.id).map(|b| b.len() as u64).unwrap_or(0);
+            if len != total_len {
+                return Err(SinkError::Retry(format!("length {len} != {total_len}")));
+            }
+            self.finished.lock().unwrap().insert(item.id, total_len);
+            Ok(7)
+        }
+    }
+
+    #[test]
+    fn end_to_end_stream_mode_against_local_stub() {
+        let mut bodies = HashMap::new();
+        bodies.insert("/big".to_string(), (0..=255u8).cycle().take(300_000).collect::<Vec<u8>>());
+        bodies.insert("/small".to_string(), b"tiny".to_vec());
+        bodies.insert("/flaky".to_string(), vec![9u8; 20_000]);
+        let stub = start_stub(bodies, &["/flaky"]);
+        let hosts = vec!["127.0.0.1".to_string()];
+        let items = vec![
+            item(1, &[format!("{}/big", stub.base).as_str()], None),
+            item(2, &[format!("{}/small", stub.base).as_str()], None),
+            item(3, &[format!("{}/flaky", stub.base).as_str()], None),
+            item(4, &[format!("{}/big", stub.base).as_str()], Some((100, 1099))),
+            item(5, &[format!("{}/ua", stub.base).as_str()], None),
+        ];
+        let sink = StreamSink {
+            got: Mutex::new(HashMap::new()),
+            finished: Mutex::new(HashMap::new()),
+            retry_once_id: Some(1),
+            retried: AtomicUsize::new(0),
+        };
+        let mut options = opts("stream app=stub");
+        options.stream = true;
+        options.per_host_cap = 8;
+        options.headers.push(("User-Agent".to_string(), "nile/0.1 Amazon".to_string()));
+        let cancel = AtomicBool::new(false);
+        let lines: Mutex<Vec<String>> = Mutex::new(Vec::new());
+        let outcome = run_fetch(
+            items,
+            &hosts,
+            &options,
+            &sink,
+            &cancel,
+            &|_: u64, _: u64| {},
+            &|line: &str| lines.lock().unwrap().push(line.to_string()),
+        );
+        let lines = lines.lock().unwrap();
+        assert!(outcome.ok(), "outcome={outcome:?} lines={lines:?}");
+        assert_eq!(outcome.items_ok, 5);
+        let got = sink.got.lock().unwrap();
+        assert_eq!(got[&1].len(), 300_000);
+        assert_eq!(got[&1][1000], (1000 % 256) as u8);
+        assert_eq!(got[&2], b"tiny".to_vec());
+        assert_eq!(got[&3], vec![9u8; 20_000]);
+        assert_eq!(got[&4].len(), 1000);
+        assert_eq!(got[&4][0], 100u8);
+        assert_eq!(got[&5], b"nile/0.1 Amazon".to_vec());
+        let finished = sink.finished.lock().unwrap();
+        assert_eq!(finished.len(), 5);
+        // Pieces credited as written + 7 extra per on_finish; the rejected attempt of /big
+        // contributed nothing (its first piece was refused before any write).
+        let written: u64 = got.values().map(|b| b.len() as u64).sum();
+        assert_eq!(outcome.bytes_credited, written + 5 * 7);
+        let hits = stub.hits.lock().unwrap();
+        assert_eq!(hits["/flaky"], 2);
+        assert!(hits["/big"] >= 3, "big={} (2 items + 1 retry)", hits["/big"]);
+        assert!(lines[0].contains(" mode=stream"), "{}", lines[0]);
+        assert!(lines[0].contains(" ceiling=8 "), "{}", lines[0]);
+        assert!(lines.last().unwrap().ends_with("result=ok"));
     }
 
     #[test]
