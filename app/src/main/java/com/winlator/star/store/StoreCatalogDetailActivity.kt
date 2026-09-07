@@ -8,22 +8,16 @@ import android.text.Html
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
 import androidx.compose.foundation.ExperimentalFoundationApi
-import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.ExperimentalLayoutApi
 import androidx.compose.foundation.layout.FlowRow
-import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
-import androidx.compose.foundation.layout.width
-import androidx.compose.foundation.lazy.LazyRow
-import androidx.compose.foundation.lazy.items
-import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Text
@@ -35,13 +29,14 @@ import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
-import androidx.compose.ui.draw.clip
-import androidx.compose.ui.layout.ContentScale
+import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.unit.dp
-import coil.compose.AsyncImage
 import com.winlator.star.core.AppOrientation
 import com.winlator.star.store.download.InfoChip
+import com.winlator.star.store.download.MediaImage
+import com.winlator.star.store.download.MediaTab
 import com.winlator.star.store.download.Store
+import com.winlator.star.store.download.StoreMedia
 import com.winlator.star.store.download.StoreBadge
 import com.winlator.star.store.download.StoreDetailScaffold
 import com.winlator.star.store.download.StoreGearItem
@@ -53,10 +48,10 @@ import org.json.JSONObject
 
 /**
  * Detail page for a catalog title the user does NOT own — the Steam detail layout
- * ([StoreDetailScaffold]) with the store's description and screenshots, a price row, and one
+ * ([StoreDetailScaffold]) with the store's description and media, a price row, and one
  * primary action that opens the store page in the in-app WebView ("Get for free" / "View on …").
  *
- * Serves both GOG and Epic: the [CatalogItem] rides in the intent, the description + screenshots
+ * Serves both GOG and Epic: the [CatalogItem] rides in the intent, the description + media
  * are fetched on open from the matching public endpoint ([GogStoreCatalog.product] /
  * [EpicStoreCatalog.offer]). Owned titles never land here — the storefronts route them to the
  * store's own detail page, which carries install / DLC / cloud saves.
@@ -116,7 +111,7 @@ class StoreCatalogDetailActivity : ComponentActivity() {
 private class CatalogDetailData(
     val lead: String,
     val full: String,
-    val screenshots: List<String>,
+    val media: StoreMedia,
     val releaseDate: String,
     val hero: String?,
 )
@@ -129,6 +124,7 @@ private fun CatalogDetailScreen(
     onOpenWeb: (url: String, title: String) -> Unit,
     onOpenBrowser: (url: String) -> Unit,
 ) {
+    val context = LocalContext.current
     val storeLabel = when (item.store) { Store.GOG -> "GOG.com"; Store.EPIC -> "Epic Games Store"; else -> item.store.name }
     var tab by remember { mutableStateOf(0) }
     var data by remember { mutableStateOf<CatalogDetailData?>(null) }
@@ -139,10 +135,11 @@ private fun CatalogDetailScreen(
         data = runCatching {
             when (item.store) {
                 Store.GOG -> GogStoreCatalog.product(item.id)?.let {
-                    CatalogDetailData(it.lead, it.full, it.screenshots, it.releaseDate, it.background)
+                    CatalogDetailData(it.lead, it.full, it.media, it.releaseDate, it.background)
                 }
                 Store.EPIC -> EpicStoreCatalog.offer(item.extra["namespace"].orEmpty(), item.id)?.let {
-                    CatalogDetailData(it.description, it.longDescription, it.screenshots, it.releaseDate, it.wideImage)
+                    val shots = it.screenshots.map { url -> MediaImage(url, url) }
+                    CatalogDetailData(it.description, it.longDescription, StoreMedia(shots, emptyList()), it.releaseDate, it.wideImage)
                 }
                 else -> null
             }
@@ -150,7 +147,7 @@ private fun CatalogDetailScreen(
         loading = false
     }
 
-    val tabs = listOf("Details", "Screenshots")
+    val tabs = listOf("Details", "Media")
     val primaryLabel = when {
         item.isFree -> "Get for free on $storeLabel"
         else -> "View on $storeLabel"
@@ -243,36 +240,12 @@ private fun CatalogDetailScreen(
                 }
             }
 
-            else -> Column(modifier = Modifier.padding(top = 6.dp, bottom = 16.dp)) {
-                val shots = data?.screenshots.orEmpty()
-                when {
-                    loading && data == null -> Box(modifier = Modifier.fillMaxWidth().padding(24.dp), contentAlignment = Alignment.Center) {
-                        CircularProgressIndicator(color = MaterialTheme.colorScheme.primary)
-                    }
-                    shots.isEmpty() -> StoreNotice(title = "No screenshots", body = "$storeLabel published no screenshots for this title.")
-                    else -> LazyRow(
-                        contentPadding = PaddingValues(horizontal = 16.dp),
-                        horizontalArrangement = Arrangement.spacedBy(10.dp),
-                    ) {
-                        items(shots, key = { it }) { url ->
-                            Box(
-                                modifier = Modifier
-                                    .width(300.dp)
-                                    .height(169.dp)
-                                    .clip(RoundedCornerShape(10.dp))
-                                    .background(MaterialTheme.colorScheme.surfaceVariant),
-                            ) {
-                                AsyncImage(
-                                    model = url,
-                                    contentDescription = null,
-                                    contentScale = ContentScale.Crop,
-                                    modifier = Modifier.fillMaxSize(),
-                                )
-                            }
-                        }
-                    }
-                }
-            }
+            else -> MediaTab(
+                media = data?.media,
+                loading = loading && data == null,
+                storeLabel = storeLabel,
+                onOpenVideo = { MediaPlayback.openVideo(context, it) },
+            )
         }
     }
 }

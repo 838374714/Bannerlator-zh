@@ -2,7 +2,10 @@ package com.winlator.star.store
 
 import android.content.Context
 import android.util.Log
+import com.winlator.star.store.download.MediaImage
+import com.winlator.star.store.download.MediaVideo
 import com.winlator.star.store.download.Store
+import com.winlator.star.store.download.StoreMedia
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
 import org.json.JSONArray
@@ -26,8 +29,8 @@ import java.util.concurrent.ConcurrentHashMap
  * `base` strings plus `finalMoney.amount` / `baseMoney.amount` and `discount` ("-85%"). Products
  * that are not for sale have `price == null`.
  *
- * Product detail (description / screenshots) comes from the equally public
- * `api.gog.com/products/{id}?expand=description,screenshots`.
+ * Product detail (description / screenshots / videos) comes from the equally public
+ * `api.gog.com/products/{id}?expand=description,screenshots,videos`.
  *
  * Everything is cached in-process (rails 30 min, searches 5 min) and the last good rails are
  * mirrored to SharedPreferences so the Store tab paints instantly — and offline — on the next open.
@@ -63,10 +66,13 @@ object GogStoreCatalog {
     class ProductDetail(
         val lead: String,
         val full: String,
+        /** Strip-size screenshot URLs (`ggvgm`); the Media tab uses [media] instead. */
         val screenshots: List<String>,
         val releaseDate: String,
         val background: String?,
         val logo: String?,
+        /** Screenshots (thumb `ggvgm`, full `ggvgm_2x`) + YouTube trailers for the Media tab. */
+        val media: StoreMedia,
     )
 
     private class Cached<T>(val value: T, val at: Long)
@@ -148,11 +154,11 @@ object GogStoreCatalog {
         results
     }
 
-    /** Description + screenshots for one product; null when GOG has no page for it. */
+    /** Description + screenshots + videos for one product; null when GOG has no page for it. */
     suspend fun product(id: String): ProductDetail? = withContext(Dispatchers.IO) {
         val now = System.currentTimeMillis()
         detailCache[id]?.let { if (now - it.at < DETAIL_TTL_MS) return@withContext it.value }
-        val body = StoreNet.get("https://api.gog.com/products/$id?expand=description,screenshots")
+        val body = StoreNet.get("https://api.gog.com/products/$id?expand=description,screenshots,videos")
         val detail = body?.let { runCatching { parseDetail(JSONObject(it)) }.getOrNull() }
         detailCache[id] = Cached(detail, now)
         detail
@@ -227,35 +233,62 @@ object GogStoreCatalog {
         )
     }
 
-    private fun parseDetail(o: JSONObject): ProductDetail {
+    /** Pure parse of an `api.gog.com/products/{id}` body (no I/O — unit-tested). */
+    internal fun parseDetail(o: JSONObject): ProductDetail {
         val desc = o.optJSONObject("description")
         val shots = ArrayList<String>()
+        val images = ArrayList<MediaImage>()
         val arr = o.optJSONArray("screenshots")
         if (arr != null) for (i in 0 until arr.length()) {
             val s = arr.optJSONObject(i) ?: continue
-            // Prefer the medium jpg; fall back to the template with a known formatter.
+            // Strip size: the pre-formatted medium jpg (`ggvgm`), else the template with that
+            // formatter. Viewer size: the same template at `ggvgm_2x` (thumb when there is none).
             var url = ""
             val formatted = s.optJSONArray("formatted_images")
             if (formatted != null) for (j in 0 until formatted.length()) {
                 val f = formatted.optJSONObject(j) ?: continue
                 if (f.optString("formatter_name") == "ggvgm") { url = f.optString("image_url"); break }
             }
-            if (url.isBlank()) {
-                val tpl = s.optString("formatter_template_url", "")
-                if (tpl.contains("{formatter}")) url = tpl.replace("{formatter}", "ggvgm").replace(".png", ".jpg")
+            val tpl = s.optString("formatter_template_url", "")
+            if (url.isBlank() && tpl.contains("{formatter}")) url = renderTemplate(tpl, "ggvgm")
+            url = absolutize(url)
+            if (url.isBlank()) continue
+            shots.add(url)
+            if (images.size < StoreMedia.MAX_SCREENSHOTS) {
+                val full = if (tpl.contains("{formatter}")) absolutize(renderTemplate(tpl, "ggvgm_2x")) else url
+                images.add(MediaImage(url, full))
             }
-            if (url.isNotBlank()) shots.add(url)
         }
-        val images = o.optJSONObject("images")
+        val videos = ArrayList<MediaVideo>()
+        val vids = o.optJSONArray("videos")
+        if (vids != null) for (i in 0 until vids.length()) {
+            val v = vids.optJSONObject(i) ?: continue
+            // GOG only embeds YouTube; anything else has no player here.
+            if (!v.optString("provider", "youtube").equals("youtube", ignoreCase = true)) continue
+            val id = v.optString("video_id", "").trim()
+            if (id.isBlank()) continue
+            val poster = absolutize(v.optString("thumbnail_url", "")).ifBlank { "https://img.youtube.com/vi/$id/hqdefault.jpg" }
+            videos.add(MediaVideo.YouTube(id, poster, ""))
+        }
+        // GOG names none of its videos: "Trailer" alone, "Trailer 1..N" when there are several.
+        val named = videos.mapIndexed { i, v ->
+            MediaVideo.YouTube((v as MediaVideo.YouTube).id, v.poster, if (videos.size == 1) "Trailer" else "Trailer ${i + 1}")
+        }
+        val imgs = o.optJSONObject("images")
         return ProductDetail(
             lead = desc?.optString("lead", "").orEmpty(),
             full = desc?.optString("full", "").orEmpty(),
             screenshots = shots,
             releaseDate = o.optString("release_date", ""),
-            background = images?.optString("background", "")?.let(::absolutize)?.ifBlank { null },
-            logo = images?.optString("logo2x", "")?.let(::absolutize)?.ifBlank { null },
+            background = imgs?.optString("background", "")?.let(::absolutize)?.ifBlank { null },
+            logo = imgs?.optString("logo2x", "")?.let(::absolutize)?.ifBlank { null },
+            media = StoreMedia(images, named),
         )
     }
+
+    /** `…_{formatter}.png` template → the jpg rendition for [formatter]. */
+    private fun renderTemplate(template: String, formatter: String): String =
+        template.replace("{formatter}", formatter).replace(".png", ".jpg")
 
     /** GOG returns protocol-relative `//images…` URLs in a few places. */
     fun absolutize(url: String?): String {

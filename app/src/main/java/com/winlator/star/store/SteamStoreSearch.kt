@@ -1,6 +1,9 @@
 package com.winlator.star.store
 
 import android.util.Log
+import com.winlator.star.store.download.MediaImage
+import com.winlator.star.store.download.MediaVideo
+import com.winlator.star.store.download.StoreMedia
 import org.json.JSONObject
 import java.net.HttpURLConnection
 import java.net.URL
@@ -121,6 +124,82 @@ object SteamStoreSearch {
             Log.w(TAG, "fetchDetails failed for $appId: ${e.message}")
             null
         }
+    }
+
+    /**
+     * Screenshots + trailers for [appId] from the appdetails endpoint (`cc` = [cc], english) — the
+     * Media tab's source. Three distinct answers, because the storefront rate limit (~200 requests
+     * per 5 minutes) must not be mistaken for "no media":
+     *  - a NON-EMPTY [StoreMedia] when Steam published any;
+     *  - [StoreMedia.EMPTY] when the app genuinely has none (or is unknown / delisted, `success:false`);
+     *  - null when the fetch could NOT tell — HTTP 429, any other non-2xx, a transport failure or a
+     *    malformed body. Callers cache null only briefly and retry on the next open.
+     * BLOCKING — call off the main thread.
+     */
+    fun fetchMedia(appId: Int, cc: String): StoreMedia? {
+        if (appId <= 0) return StoreMedia.EMPTY
+        val ccParam = cc.takeIf { it.length == 2 }?.uppercase() ?: "US"
+        val url = "https://store.steampowered.com/api/appdetails?appids=$appId&cc=$ccParam&l=english" +
+            "&filters=screenshots,movies"
+        return when (val out = httpGetDetailed(url)) {
+            is HttpOutcome.Ok -> parseMedia(out.body, appId)
+            is HttpOutcome.HttpError -> {
+                Log.w(TAG, "fetchMedia($appId): HTTP ${out.code}" + if (out.code == 429) " (rate limited)" else "")
+                null
+            }
+            is HttpOutcome.Transport -> null
+            HttpOutcome.EmptyBody -> null
+        }
+    }
+
+    /**
+     * Pure parse of an appdetails body for [appId] (no I/O, no logging — unit-tested). null =
+     * malformed body, treated like a transport failure by [fetchMedia]. Screenshots: `path_thumbnail`
+     * for the strip, `path_full` for the viewer, capped at [StoreMedia.MAX_SCREENSHOTS]. Movies: the
+     * mp4 480p rendition by default (max / webm as fallbacks — see [pickMovieUrl]); every URL is
+     * forced to https because the CDN hands out `http://video.akamai…` and the app permits cleartext
+     * only to Steam CONTENT hosts.
+     */
+    internal fun parseMedia(body: String, appId: Int): StoreMedia? {
+        val root = try { JSONObject(body) } catch (_: Exception) { return null }
+        val entry = root.optJSONObject(appId.toString()) ?: return null
+        if (!entry.optBoolean("success", false)) return StoreMedia.EMPTY
+        // With `filters=` Steam answers `"data": []` (an ARRAY) when nothing matched the filter.
+        val data = entry.optJSONObject("data") ?: return StoreMedia.EMPTY
+        val shots = ArrayList<MediaImage>()
+        data.optJSONArray("screenshots")?.let { arr ->
+            for (i in 0 until arr.length()) {
+                if (shots.size >= StoreMedia.MAX_SCREENSHOTS) break
+                val s = arr.optJSONObject(i) ?: continue
+                val full = httpsOf(s.optString("path_full"))
+                val thumb = httpsOf(s.optString("path_thumbnail")).ifBlank { full }
+                if (full.isNotBlank()) shots.add(MediaImage(thumb, full))
+            }
+        }
+        val videos = ArrayList<MediaVideo>()
+        data.optJSONArray("movies")?.let { arr ->
+            for (i in 0 until arr.length()) {
+                val m = arr.optJSONObject(i) ?: continue
+                val url = pickMovieUrl(m) ?: continue
+                val name = m.optString("name").trim().ifBlank { "Trailer ${videos.size + 1}" }
+                videos.add(MediaVideo.Direct(url, httpsOf(m.optString("thumbnail")).ifBlank { null }, name))
+            }
+        }
+        return StoreMedia(shots, videos)
+    }
+
+    /** mp4 480 (default, light on mobile data) → mp4 max → webm 480 → webm max. */
+    private fun pickMovieUrl(m: JSONObject): String? {
+        val mp4 = m.optJSONObject("mp4")
+        val webm = m.optJSONObject("webm")
+        return listOf(mp4?.optString("480"), mp4?.optString("max"), webm?.optString("480"), webm?.optString("max"))
+            .firstOrNull { !it.isNullOrBlank() }
+            ?.let(::httpsOf)
+    }
+
+    private fun httpsOf(url: String?): String {
+        if (url.isNullOrBlank()) return ""
+        return if (url.startsWith("http://")) "https://" + url.removePrefix("http://") else url
     }
 
     /** Decode HTML entities/tags to plain text (Steam descriptions contain &amp;, &#39;, <br>, …). */

@@ -49,7 +49,10 @@ import com.winlator.star.store.download.DownloadsButton
 import com.winlator.star.store.download.INSTALLED_GREEN
 import com.winlator.star.store.download.StoreDownloadHooks
 import com.winlator.star.store.download.InfoChip
+import com.winlator.star.store.download.MediaTab
+import com.winlator.star.store.download.MediaVideo
 import com.winlator.star.store.download.Store
+import com.winlator.star.store.download.StoreMedia
 import com.winlator.star.store.download.StoreActionButton
 import com.winlator.star.store.download.StoreActionRow
 import com.winlator.star.store.download.StoreBadge
@@ -150,6 +153,9 @@ class GogGameDetailActivity : ComponentActivity(), GogRedistInstaller.Host {
     private var updateBtnVisible by mutableStateOf(false)
 
     private var dlcJson by mutableStateOf<String?>(null)
+    // Media tab: GOG's public product page screenshots + trailers (StoreMediaCache first).
+    private var media by mutableStateOf<StoreMedia?>(null)
+    private var mediaLoading by mutableStateOf(true)
     // gap#5 DLC install: per-DLC row state (id → Install / Installing…% / Installed), observable so
     // the DLC section re-renders as each install progresses. Base-installed gate (DLC interleaves
     // into the base install dir, so it needs the base game present first).
@@ -233,6 +239,7 @@ class GogGameDetailActivity : ComponentActivity(), GogRedistInstaller.Host {
         refreshActionState()
         observeRegistry()
         loadInstallSize()
+        loadMedia()
 
         setContent {
             WinlatorTheme {
@@ -329,6 +336,9 @@ class GogGameDetailActivity : ComponentActivity(), GogRedistInstaller.Host {
                     },
                     onUploadSaves = { cloudSync(up = true) },
                     onDownloadSaves = { cloudSync(up = false) },
+                    media = media,
+                    mediaLoading = mediaLoading,
+                    onOpenVideo = { MediaPlayback.openVideo(this@GogGameDetailActivity, it) },
                 )
 
                 showExePicker?.let { state ->
@@ -377,6 +387,23 @@ class GogGameDetailActivity : ComponentActivity(), GogRedistInstaller.Host {
                 }
                 conn.disconnect()
             } catch (_: Exception) {}
+        }
+    }
+
+
+    /** Media tab source: the shared cache, else GOG's public product page (one request per open). */
+    private fun loadMedia() {
+        lifecycleScope.launch {
+            mediaLoading = true
+            val ctx = this@GogGameDetailActivity
+            media = withContext(Dispatchers.IO) {
+                StoreMediaCache.get(ctx, Store.GOG, gameId) ?: run {
+                    val fetched = runCatching { GogStoreCatalog.product(gameId)?.media }.getOrNull()
+                    StoreMediaCache.put(ctx, Store.GOG, gameId, fetched ?: StoreMedia.EMPTY, miss = fetched == null)
+                    fetched ?: StoreMedia.EMPTY
+                }
+            }
+            mediaLoading = false
         }
     }
 
@@ -872,6 +899,9 @@ private fun GogGameDetailScreen(
     onBrowseCloud: () -> Unit,
     onUploadSaves: () -> Unit,
     onDownloadSaves: () -> Unit,
+    media: StoreMedia?,
+    mediaLoading: Boolean,
+    onOpenVideo: (MediaVideo) -> Unit,
 ) {
     var tab by remember { mutableStateOf(0) }
     val downloading = progressVisible && installBtnText == "Cancel"
@@ -900,7 +930,12 @@ private fun GogGameDetailScreen(
         if (dlcJson.isNullOrEmpty() || dlcJson == "[]") 0
         else runCatching { org.json.JSONArray(dlcJson).length() }.getOrDefault(0)
     }
-    val tabs = listOf("Details", "DLC", "Cloud saves")
+    // "Media" is appended only once the fetch found any, so the fixed indices above stay valid.
+    val mediaVisible = media?.isEmpty == false
+    val tabs = buildList {
+        add("Details"); add("DLC"); add("Cloud saves")
+        if (mediaVisible) add("Media")
+    }
 
     StoreDetailScaffold(
         onBack = onBack,
@@ -929,7 +964,10 @@ private fun GogGameDetailScreen(
         tabs = tabs,
         selectedTab = tab,
         onSelectTab = { tab = it },
-        tabBadges = if (dlcCount > 0) mapOf(1 to "$dlcCount") else emptyMap(),
+        tabBadges = buildMap {
+            if (dlcCount > 0) put(1, "$dlcCount")
+            if (mediaVisible) put(3, "${media?.count ?: 0}")
+        },
     ) {
         when (tab) {
             0 -> Column(modifier = Modifier.padding(bottom = 8.dp)) {
@@ -988,7 +1026,7 @@ private fun GogGameDetailScreen(
                 }
             }
 
-            else -> Column(modifier = Modifier.padding(top = 6.dp, bottom = 8.dp)) {
+            2 -> Column(modifier = Modifier.padding(top = 6.dp, bottom = 8.dp)) {
                 StoreSection(title = "Cloud Saves") {
                     GogCloudSavesContent(
                         saveDirText = cloudSaveDirText,
@@ -1002,6 +1040,13 @@ private fun GogGameDetailScreen(
                     )
                 }
             }
+
+            3 -> MediaTab(
+                media = media,
+                loading = mediaLoading,
+                storeLabel = "GOG.com",
+                onOpenVideo = onOpenVideo,
+            )
         }
         Spacer(Modifier.height(16.dp))
     }
