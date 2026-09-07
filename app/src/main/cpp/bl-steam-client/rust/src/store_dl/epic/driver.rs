@@ -285,6 +285,9 @@ pub fn run_plan(
         ca_bundle_path: req.ca_bundle_path.clone(),
         process_workers: req.process_workers.max(1),
         label: req.label.clone(),
+        // Whole-body mode (Epic chunks are ≤1 MiB compressed); `stream` and any future field
+        // keep the core's defaults.
+        ..FetchOptions::default()
     };
 
     let sink = ChunkCacheSink {
