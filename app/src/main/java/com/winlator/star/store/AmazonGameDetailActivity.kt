@@ -23,6 +23,7 @@ import androidx.compose.foundation.verticalScroll
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableStateOf
@@ -47,7 +48,9 @@ import com.winlator.star.store.download.DownloadsButton
 import com.winlator.star.store.download.formatDownloadSize
 import com.winlator.star.store.download.INSTALLED_GREEN
 import com.winlator.star.store.download.InfoChip
+import com.winlator.star.store.download.MediaTab
 import com.winlator.star.store.download.Store
+import com.winlator.star.store.download.StoreMedia
 import com.winlator.star.store.download.StoreActionButton
 import com.winlator.star.store.download.StoreActionRow
 import com.winlator.star.store.download.StoreBadge
@@ -792,6 +795,19 @@ private fun AmazonGameDetailScreen(
     val dlcCount = remember(dlcJson) {
         if (dlcJson.isEmpty() || dlcJson == "[]") 0 else runCatching { org.json.JSONArray(dlcJson).length() }.getOrDefault(0)
     }
+    // Media tab: Amazon ships screenshots / trailers with the entitlement, so this is a pure
+    // library-cache read (no request). Null until a sync has recorded media for this title —
+    // then the tab simply is not offered. Parsed off the main thread: the cache is one JSON
+    // array for the whole library.
+    var media by remember { mutableStateOf<StoreMedia?>(null) }
+    LaunchedEffect(productId) {
+        media = if (productId.isNullOrEmpty()) null
+        else withContext(Dispatchers.IO) { AmazonLibrarySync.cachedMedia(context, productId) }
+    }
+    val hasMedia = media?.isEmpty == false
+    // Appended LAST so the Details / DLC indices never move.
+    val tabs = if (hasMedia) listOf("Details", "DLC", "Media") else listOf("Details", "DLC")
+    if (tab >= tabs.size) tab = 0
     // Poster for the hero when the library sync has resolved one; the square icon otherwise.
     val heroCandidates = remember(productId, artUrl) {
         listOfNotNull(
@@ -824,10 +840,13 @@ private fun AmazonGameDetailScreen(
         } else null,
         primary = primary,
         gear = gear,
-        tabs = listOf("Details", "DLC"),
+        tabs = tabs,
         selectedTab = tab,
         onSelectTab = { tab = it },
-        tabBadges = if (dlcCount > 0) mapOf(1 to "$dlcCount") else emptyMap(),
+        tabBadges = buildMap {
+            if (dlcCount > 0) put(1, "$dlcCount")
+            media?.takeIf { hasMedia }?.let { put(2, "${it.count}") }
+        },
     ) {
         when (tab) {
             0 -> Column(modifier = Modifier.padding(bottom = 8.dp)) {
@@ -855,7 +874,7 @@ private fun AmazonGameDetailScreen(
                 }
             }
 
-            else -> Column(modifier = Modifier.padding(top = 6.dp, bottom = 8.dp)) {
+            1 -> Column(modifier = Modifier.padding(top = 6.dp, bottom = 8.dp)) {
                 StoreSection(title = "DLC") {
                     AmazonDlcContent(
                         dlcJson = dlcJson,
@@ -863,6 +882,13 @@ private fun AmazonGameDetailScreen(
                     )
                 }
             }
+
+            else -> MediaTab(
+                media = media,
+                loading = false,
+                storeLabel = "Amazon Games",
+                onOpenVideo = { MediaPlayback.openVideo(context, it) },
+            )
         }
         Spacer(Modifier.height(16.dp))
     }

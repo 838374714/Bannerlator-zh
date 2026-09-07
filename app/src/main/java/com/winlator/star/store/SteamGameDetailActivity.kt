@@ -96,7 +96,9 @@ import com.winlator.star.store.compose.ContainerPickerDialog
 import com.winlator.star.store.compose.openShortcutsScreen
 import com.winlator.star.store.download.DownloadRegistry
 import com.winlator.star.store.download.DownloadsButton
+import com.winlator.star.store.download.MediaTab
 import com.winlator.star.store.download.Store
+import com.winlator.star.store.download.StoreMedia
 import com.winlator.star.store.download.formatDownloadSpeed
 import com.winlator.star.store.download.formatEta
 import com.winlator.star.ui.theme.WinlatorTheme
@@ -1397,6 +1399,8 @@ private enum class DetailTab(val label: String) {
     ACHIEVEMENTS("Achievements"),
     DLC("DLC"),
     CLOUD("Cloud saves"),
+    /** Store screenshots + trailers; only in the strip once the appdetails fetch found any. */
+    MEDIA("Media"),
 }
 
 // ── Achievements/tab mockup palette ─────────────────────────────────────────────────────────────
@@ -1529,6 +1533,33 @@ private fun SteamGameDetailScreen(
         }
         achievements = list
         achLoading = false
+    }
+
+    // Media tab — store screenshots + trailers from appdetails, ONE request per page open (cache hits
+    // and misses both count against Steam's rate limit, so the shared StoreMediaCache answers first;
+    // a 429/transport failure is cached for two minutes only). The tab appears once non-empty.
+    var media by remember(appId) { mutableStateOf<StoreMedia?>(null) }
+    var mediaLoading by remember(appId) { mutableStateOf(true) }
+    LaunchedEffect(appId) {
+        mediaLoading = true
+        val id = appId.toString()
+        media = withContext(Dispatchers.IO) {
+            StoreMediaCache.get(context, Store.STEAM, id) ?: run {
+                val fetched = try {
+                    SteamStoreSearch.fetchMedia(appId, SteamRegion.storeCountryCode(context))
+                } catch (_: Throwable) { null }
+                StoreMediaCache.put(context, Store.STEAM, id, fetched ?: StoreMedia.EMPTY, miss = fetched == null)
+                fetched ?: StoreMedia.EMPTY
+            }
+        }
+        mediaLoading = false
+    }
+    val mediaTabVisible = media?.isEmpty == false
+    val detailTabs = remember(mediaTabVisible) {
+        DetailTab.values().filter { it != DetailTab.MEDIA || mediaTabVisible }
+    }
+    LaunchedEffect(mediaTabVisible) {
+        if (!mediaTabVisible && selectedTab == DetailTab.MEDIA) selectedTab = DetailTab.DETAILS
     }
 
     // DLC tab — the FULL owned-DLC catalogue (broader than the depot-bundled `dlcEntries` picker set:
@@ -1785,9 +1816,11 @@ private fun SteamGameDetailScreen(
         // Tab strip — Details · Achievements (done/total) · DLC · Cloud saves. Styled like the
         // action buttons and horizontally scrollable, per the mockup.
         SteamDetailTabs(
+            tabs = detailTabs,
             selected = selectedTab,
             achDone = achievements.count { it.unlocked },
             achTotal = achievements.size,
+            mediaCount = media?.count ?: 0,
             onSelect = { selectedTab = it },
         )
 
@@ -1949,6 +1982,14 @@ private fun SteamGameDetailScreen(
                     }
                 }
             }
+
+            // Media = the shared store Media tab (trailers + screenshots, viewer, playback handoff).
+            DetailTab.MEDIA -> MediaTab(
+                media = media,
+                loading = mediaLoading,
+                storeLabel = "Steam",
+                onOpenVideo = { MediaPlayback.openVideo(context, it) },
+            )
 
             // Cloud saves = the existing three-tier manager when it's available (installed + a live
             // Steam session); otherwise a compact status line explaining what's needed.
@@ -2227,9 +2268,11 @@ private fun GearMenuItem(
  */
 @Composable
 private fun SteamDetailTabs(
+    tabs: List<DetailTab>,
     selected: DetailTab,
     achDone: Int,
     achTotal: Int,
+    mediaCount: Int,
     onSelect: (DetailTab) -> Unit,
 ) {
     Row(
@@ -2239,9 +2282,13 @@ private fun SteamDetailTabs(
             .padding(start = 16.dp, end = 16.dp, top = 14.dp, bottom = 6.dp),
         horizontalArrangement = Arrangement.spacedBy(6.dp),
     ) {
-        DetailTab.values().forEach { tab ->
+        tabs.forEach { tab ->
             val isSel = tab == selected
-            val badge = if (tab == DetailTab.ACHIEVEMENTS && achTotal > 0) "$achDone/$achTotal" else null
+            val badge = when {
+                tab == DetailTab.ACHIEVEMENTS && achTotal > 0 -> "$achDone/$achTotal"
+                tab == DetailTab.MEDIA && mediaCount > 0 -> "$mediaCount"
+                else -> null
+            }
             val shape = RoundedCornerShape(9.dp)
             Row(
                 verticalAlignment = Alignment.CenterVertically,

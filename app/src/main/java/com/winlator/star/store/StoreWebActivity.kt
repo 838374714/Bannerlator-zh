@@ -5,7 +5,9 @@ import android.content.Context
 import android.content.Intent
 import android.net.Uri
 import android.os.Bundle
+import android.view.View
 import android.view.ViewGroup
+import android.widget.FrameLayout
 import android.webkit.CookieManager
 import android.webkit.WebChromeClient
 import android.webkit.WebView
@@ -62,11 +64,14 @@ class StoreWebActivity : ComponentActivity() {
     companion object {
         const val EXTRA_URL = "url"
         const val EXTRA_TITLE = "title"
+        /** Let the page start audio/video without a tap — the Media tab's YouTube embeds. */
+        const val EXTRA_ALLOW_AUTOPLAY = "allow_autoplay"
 
-        fun intent(ctx: Context, url: String, title: String): Intent =
+        fun intent(ctx: Context, url: String, title: String, allowAutoplay: Boolean = false): Intent =
             Intent(ctx, StoreWebActivity::class.java)
                 .putExtra(EXTRA_URL, url)
                 .putExtra(EXTRA_TITLE, title)
+                .putExtra(EXTRA_ALLOW_AUTOPLAY, allowAutoplay)
     }
 
     private var webView: WebView? = null
@@ -77,6 +82,7 @@ class StoreWebActivity : ComponentActivity() {
         AppOrientation.apply(this)
         val url = intent.getStringExtra(EXTRA_URL).orEmpty()
         val pageTitle = intent.getStringExtra(EXTRA_TITLE).orEmpty()
+        val allowAutoplay = intent.getBooleanExtra(EXTRA_ALLOW_AUTOPLAY, false)
         if (url.isBlank()) { finish(); return }
         setResult(RESULT_OK)
 
@@ -85,84 +91,126 @@ class StoreWebActivity : ComponentActivity() {
                 var progress by remember { mutableIntStateOf(0) }
                 var title by remember { mutableStateOf(pageTitle) }
                 var canGoBack by remember { mutableStateOf(false) }
+                // A page's own full-screen element (the YouTube embed's fullscreen button).
+                var customView by remember { mutableStateOf<View?>(null) }
+                var customViewCallback by remember { mutableStateOf<WebChromeClient.CustomViewCallback?>(null) }
 
-                // Back walks the page history first, then closes.
+                // Back leaves a full-screen element, then walks the page history, then closes.
                 BackHandler(enabled = true) {
                     val wv = webView
-                    if (wv != null && wv.canGoBack()) wv.goBack() else finish()
+                    if (customView != null) {
+                        customViewCallback?.onCustomViewHidden()
+                        customView = null; customViewCallback = null
+                    } else if (wv != null && wv.canGoBack()) wv.goBack() else finish()
                 }
 
-                Column(
-                    modifier = Modifier
-                        .fillMaxSize()
-                        .background(MaterialTheme.colorScheme.background)
-                        .systemBarsPadding(),
-                ) {
-                    Row(
-                        modifier = Modifier.fillMaxWidth().padding(horizontal = 4.dp, vertical = 2.dp),
-                        verticalAlignment = Alignment.CenterVertically,
+                Box(modifier = Modifier.fillMaxSize().background(MaterialTheme.colorScheme.background)) {
+                    Column(
+                        modifier = Modifier
+                            .fillMaxSize()
+                            .systemBarsPadding(),
                     ) {
-                        IconButton(onClick = { finish() }) {
-                            Icon(Icons.Filled.Close, contentDescription = "Close", tint = MaterialTheme.colorScheme.onBackground)
+                        Row(
+                            modifier = Modifier.fillMaxWidth().padding(horizontal = 4.dp, vertical = 2.dp),
+                            verticalAlignment = Alignment.CenterVertically,
+                        ) {
+                            IconButton(onClick = { finish() }) {
+                                Icon(Icons.Filled.Close, contentDescription = "Close", tint = MaterialTheme.colorScheme.onBackground)
+                            }
+                            Text(
+                                text = title.ifBlank { url },
+                                style = MaterialTheme.typography.titleSmall,
+                                fontWeight = FontWeight.Bold,
+                                color = MaterialTheme.colorScheme.onBackground,
+                                maxLines = 1,
+                                overflow = TextOverflow.Ellipsis,
+                                modifier = Modifier.weight(1f),
+                            )
+                            Spacer(Modifier.padding(2.dp))
+                            IconButton(onClick = {
+                                runCatching { startActivity(Intent(Intent.ACTION_VIEW, Uri.parse(webView?.url ?: url))) }
+                            }) {
+                                Icon(Icons.Filled.OpenInNew, contentDescription = "Open in browser", tint = MaterialTheme.colorScheme.primary)
+                            }
                         }
-                        Text(
-                            text = title.ifBlank { url },
-                            style = MaterialTheme.typography.titleSmall,
-                            fontWeight = FontWeight.Bold,
-                            color = MaterialTheme.colorScheme.onBackground,
-                            maxLines = 1,
-                            overflow = TextOverflow.Ellipsis,
-                            modifier = Modifier.weight(1f),
-                        )
-                        Spacer(Modifier.padding(2.dp))
-                        IconButton(onClick = {
-                            runCatching { startActivity(Intent(Intent.ACTION_VIEW, Uri.parse(webView?.url ?: url))) }
-                        }) {
-                            Icon(Icons.Filled.OpenInNew, contentDescription = "Open in browser", tint = MaterialTheme.colorScheme.primary)
+                        if (progress in 1..99) {
+                            LinearProgressIndicator(
+                                progress = { progress / 100f },
+                                modifier = Modifier.fillMaxWidth().height(2.dp),
+                                color = MaterialTheme.colorScheme.primary,
+                                trackColor = MaterialTheme.colorScheme.surfaceVariant,
+                            )
+                        }
+                        Box(modifier = Modifier.weight(1f).fillMaxWidth()) {
+                            AndroidView(
+                                modifier = Modifier.fillMaxSize(),
+                                factory = { context ->
+                                    WebView(context).apply {
+                                        layoutParams = ViewGroup.LayoutParams(
+                                            ViewGroup.LayoutParams.MATCH_PARENT,
+                                            ViewGroup.LayoutParams.MATCH_PARENT,
+                                        )
+                                        settings.javaScriptEnabled = true
+                                        settings.domStorageEnabled = true
+                                        settings.databaseEnabled = true
+                                        settings.loadWithOverviewMode = true
+                                        settings.useWideViewPort = true
+                                        settings.setSupportZoom(true)
+                                        settings.builtInZoomControls = true
+                                        settings.displayZoomControls = false
+                                        settings.mediaPlaybackRequiresUserGesture = !allowAutoplay
+                                        CookieManager.getInstance().setAcceptCookie(true)
+                                        CookieManager.getInstance().setAcceptThirdPartyCookies(this, true)
+                                        webViewClient = object : WebViewClient() {
+                                            override fun onPageFinished(view: WebView, url: String?) {
+                                                canGoBack = view.canGoBack()
+                                                view.title?.takeIf { it.isNotBlank() }?.let { title = it }
+                                                CookieManager.getInstance().flush()
+                                            }
+                                        }
+                                        webChromeClient = object : WebChromeClient() {
+                                            override fun onProgressChanged(view: WebView, newProgress: Int) {
+                                                progress = newProgress
+                                            }
+
+                                            override fun onShowCustomView(view: View?, callback: CustomViewCallback?) {
+                                                customView = view
+                                                customViewCallback = callback
+                                            }
+
+                                            override fun onHideCustomView() {
+                                                customView = null
+                                                customViewCallback = null
+                                            }
+                                        }
+                                        webView = this
+                                        loadUrl(url)
+                                    }
+                                },
+                            )
                         }
                     }
-                    if (progress in 1..99) {
-                        LinearProgressIndicator(
-                            progress = { progress / 100f },
-                            modifier = Modifier.fillMaxWidth().height(2.dp),
-                            color = MaterialTheme.colorScheme.primary,
-                            trackColor = MaterialTheme.colorScheme.surfaceVariant,
-                        )
-                    }
-                    Box(modifier = Modifier.weight(1f).fillMaxWidth()) {
+                    // Full-screen video element over everything (no system-bar inset: it is the video).
+                    val cv = customView
+                    if (cv != null) {
                         AndroidView(
-                            modifier = Modifier.fillMaxSize(),
+                            modifier = Modifier.fillMaxSize().background(androidx.compose.ui.graphics.Color.Black),
                             factory = { context ->
-                                WebView(context).apply {
+                                FrameLayout(context).apply {
                                     layoutParams = ViewGroup.LayoutParams(
                                         ViewGroup.LayoutParams.MATCH_PARENT,
                                         ViewGroup.LayoutParams.MATCH_PARENT,
                                     )
-                                    settings.javaScriptEnabled = true
-                                    settings.domStorageEnabled = true
-                                    settings.databaseEnabled = true
-                                    settings.loadWithOverviewMode = true
-                                    settings.useWideViewPort = true
-                                    settings.setSupportZoom(true)
-                                    settings.builtInZoomControls = true
-                                    settings.displayZoomControls = false
-                                    settings.mediaPlaybackRequiresUserGesture = true
-                                    CookieManager.getInstance().setAcceptCookie(true)
-                                    CookieManager.getInstance().setAcceptThirdPartyCookies(this, true)
-                                    webViewClient = object : WebViewClient() {
-                                        override fun onPageFinished(view: WebView, url: String?) {
-                                            canGoBack = view.canGoBack()
-                                            view.title?.takeIf { it.isNotBlank() }?.let { title = it }
-                                            CookieManager.getInstance().flush()
-                                        }
-                                    }
-                                    webChromeClient = object : WebChromeClient() {
-                                        override fun onProgressChanged(view: WebView, newProgress: Int) {
-                                            progress = newProgress
-                                        }
-                                    }
-                                    webView = this
-                                    loadUrl(url)
+                                }
+                            },
+                            update = { holder ->
+                                if (cv.parent !== holder) {
+                                    (cv.parent as? ViewGroup)?.removeView(cv)
+                                    holder.removeAllViews()
+                                    holder.addView(cv, ViewGroup.LayoutParams(
+                                        ViewGroup.LayoutParams.MATCH_PARENT,
+                                        ViewGroup.LayoutParams.MATCH_PARENT,
+                                    ))
                                 }
                             },
                         )

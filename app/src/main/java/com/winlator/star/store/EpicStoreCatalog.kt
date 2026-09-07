@@ -2,7 +2,10 @@ package com.winlator.star.store
 
 import android.content.Context
 import android.util.Log
+import com.winlator.star.store.download.MediaImage
+import com.winlator.star.store.download.MediaVideo
 import com.winlator.star.store.download.Store
+import com.winlator.star.store.download.StoreMedia
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
 import org.json.JSONArray
@@ -96,28 +99,48 @@ object EpicStoreCatalog {
         onSale: Boolean? = null,
         freeGame: Boolean? = null,
         releasedOnly: Boolean = false,
-    ): List<CatalogItem> {
+        namespace: String? = null,
+    ): List<CatalogItem> = parseElements(
+        searchStoreRaw(count, keywords, sortBy, sortDir, onSale, freeGame, releasedOnly, namespace),
+    )
+
+    /**
+     * The raw `elements` of one `searchStore` call. [namespace] narrows the search to a single
+     * product sandbox (how a library game finds its offer); the other filters are unchanged.
+     */
+    private fun searchStoreRaw(
+        count: Int,
+        keywords: String? = null,
+        sortBy: String = "relevancy",
+        sortDir: String = "DESC",
+        onSale: Boolean? = null,
+        freeGame: Boolean? = null,
+        releasedOnly: Boolean = false,
+        namespace: String? = null,
+    ): JSONArray {
         val args = StringBuilder()
         args.append("category:\"games/edition/base\",count:\$count,country:\$country,locale:\$locale,")
         args.append("sortBy:\$sortBy,sortDir:\$sortDir,allowCountries:\$country")
         if (keywords != null) args.append(",keywords:\$keywords")
+        if (namespace != null) args.append(",namespace:\$namespace")
         if (onSale != null) args.append(",onSale:$onSale")
         if (freeGame != null) args.append(",freeGame:$freeGame")
         if (releasedOnly) args.append(",releaseDate:\"[,${nowIso()}]\"")
         val query = "query q(\$count:Int,\$country:String!,\$locale:String,\$sortBy:String,\$sortDir:String" +
             (if (keywords != null) ",\$keywords:String" else "") +
+            (if (namespace != null) ",\$namespace:String" else "") +
             "){Catalog{searchStore($args){elements{$ELEMENT_FIELDS} paging{total}}}}"
         val vars = JSONObject()
             .put("count", count).put("country", country()).put("locale", "en-US")
             .put("sortBy", sortBy).put("sortDir", sortDir)
         if (keywords != null) vars.put("keywords", keywords)
+        if (namespace != null) vars.put("namespace", namespace)
         val body = JSONObject().put("query", query).put("variables", vars).toString()
-        val resp = StoreNet.postJson(GRAPHQL, body) ?: return emptyList()
+        val resp = StoreNet.postJson(GRAPHQL, body) ?: return JSONArray()
         return runCatching {
-            val elements = JSONObject(resp).optJSONObject("data")?.optJSONObject("Catalog")
+            JSONObject(resp).optJSONObject("data")?.optJSONObject("Catalog")
                 ?.optJSONObject("searchStore")?.optJSONArray("elements") ?: JSONArray()
-            parseElements(elements)
-        }.onFailure { Log.w(TAG, "searchStore parse failed: ${it.message}") }.getOrDefault(emptyList())
+        }.onFailure { Log.w(TAG, "searchStore parse failed: ${it.message}") }.getOrDefault(JSONArray())
     }
 
     private fun parseElements(arr: JSONArray): List<CatalogItem> {
@@ -360,20 +383,242 @@ object EpicStoreCatalog {
      * `pages[].data.gallery.galleryImages[].src`). Undocumented and edge-guarded; empty on any miss.
      */
     private fun productPageScreenshots(slug: String): List<String> {
-        val body = StoreNet.get("https://store-content-ipv4.ak.epicgames.com/api/en-US/content/products/$slug")
-            ?: return emptyList()
-        return runCatching {
-            val pages = JSONObject(body).optJSONArray("pages") ?: return emptyList()
-            val out = ArrayList<String>()
-            for (p in 0 until pages.length()) {
-                val gallery = pages.optJSONObject(p)?.optJSONObject("data")?.optJSONObject("gallery")
-                    ?.optJSONArray("galleryImages") ?: continue
-                for (g in 0 until gallery.length()) {
-                    gallery.optJSONObject(g)?.optString("src")?.takeIf { it.isNotBlank() }?.let { out.add(it) }
+        val body = StoreNet.get(CONTENT_API + slug) ?: return emptyList()
+        return runCatching { parseProductPage(body).screenshots.map { it.full } }.getOrDefault(emptyList())
+    }
+
+    // ── Media tab (screenshots + trailers) ────────────────────────────────────────────────────
+
+    private const val CONTENT_API = "https://store-content-ipv4.ak.epicgames.com/api/en-US/content/products/"
+    private const val MAX_SHOTS = 24
+    private const val MAX_VIDEOS = 4
+    /** Thumbnail variant both Epic image CDNs serve (a 3840x2160 gallery source drops to ~50 KB). */
+    private const val THUMB_SUFFIX = "?resize=1&w=640"
+    private const val VIDEO_SCHEME = "com.epicgames.video://"
+    private const val VIDEO_SCHEME_QS = "com.epicgames.video.qs://"
+    private val ID_CHARS = Regex("^[0-9a-fA-F-]{8,64}$")
+    /** Rendition preference: 480p first (phone bandwidth — the shared MediaTab default), then up. */
+    private val OUTPUT_ORDER = listOf("low", "medium", "high")
+
+    /**
+     * A trailer before its playable URL is known. Exactly one of [mediaRefId] (legacy CMS
+     * carousel, `Media.getMediaRef`) or [videoId] (modern `heroCarouselVideo`,
+     * `Video.fetchVideoByLocale`) is set.
+     */
+    internal class VideoRef(val mediaRefId: String?, val videoId: String?, val poster: String?, val title: String)
+
+    /** One page's media with its trailers still unresolved. */
+    internal class PageMedia(val screenshots: List<MediaImage>, val videos: List<VideoRef>) {
+        val isEmpty: Boolean get() = screenshots.isEmpty() && videos.isEmpty()
+    }
+
+    private fun thumbOf(url: String): String = if (url.contains('?')) url else url + THUMB_SUFFIX
+
+    /**
+     * The store offer a LIBRARY game (namespace + catalogItemId) belongs to, or null. Matches on
+     * `items[].id == catalogItemId` (the rule the store tab uses for ownership), else the first
+     * base-game offer in that namespace. The raw element is returned because the media fields
+     * (`featuredMedia` / `heroCarouselVideo` keyImages, `productSlug`) are not on [CatalogItem].
+     */
+    fun offerForLibraryGame(namespace: String, catalogItemId: String): JSONObject? {
+        if (namespace.isBlank()) return null
+        val elements = searchStoreRaw(5, namespace = namespace)
+        var first: JSONObject? = null
+        for (i in 0 until elements.length()) {
+            val e = elements.optJSONObject(i) ?: continue
+            if (first == null) first = e
+            val items = e.optJSONArray("items") ?: continue
+            for (j in 0 until items.length()) {
+                if (items.optJSONObject(j)?.optString("id") == catalogItemId) return e
+            }
+        }
+        return first
+    }
+
+    /**
+     * Screenshots + trailers for a library game. [StoreMedia.EMPTY] when the offer was found but
+     * publishes nothing (cache it as a genuine "none"); null when the offer lookup itself failed —
+     * offline, a store hiccup, or a title not on the store — which the caller should cache only
+     * briefly (`StoreMediaCache.put(miss = true)`). Never throws. Blocking; IO thread only.
+     * Legacy offers (`productSlug` set) prefer the richer CMS page, modern ones their `keyImages`;
+     * each falls back to the other. 1 GraphQL search + at most one content GET + one resolve POST.
+     */
+    fun libraryGameMedia(namespace: String, catalogItemId: String): StoreMedia? = runCatching {
+        val offer = offerForLibraryGame(namespace, catalogItemId) ?: return@runCatching null
+        val productSlug = offer.optString("productSlug", "")
+        val legacy = productSlug.isNotBlank() && productSlug != "null"
+        val slug = pageSlugOf(offer)
+        val fromPage = { if (slug.isNotBlank()) productPageMedia(slug) else null }
+        val fromOffer = { parseOfferMedia(offer.optJSONArray("keyImages")).takeIf { !it.isEmpty }?.let { resolve(it) } }
+        val media = (if (legacy) fromPage() ?: fromOffer() else fromOffer() ?: fromPage()) ?: StoreMedia.EMPTY
+        Log.i(TAG, "media ns=$namespace slug=$slug legacy=$legacy -> shots=${media.screenshots.size} videos=${media.videos.size}")
+        media
+    }.onFailure { Log.w(TAG, "libraryGameMedia failed: ${it.message}") }.getOrNull()
+
+    /**
+     * Gallery + carousel trailers of a product page on the content API, or null when the page is
+     * unknown (modern offers) or has nothing. Blocking; IO thread only.
+     */
+    fun productPageMedia(slug: String): StoreMedia? {
+        val body = StoreNet.get(CONTENT_API + slug) ?: return null
+        val page = runCatching { parseProductPage(body) }
+            .onFailure { Log.w(TAG, "product page parse failed: ${it.message}") }.getOrNull() ?: return null
+        if (page.isEmpty) return null
+        return resolve(page)
+    }
+
+    /**
+     * Pure parser for the content API body: the `home` page (or the first one with anything)
+     * → `data.gallery.galleryImages[].src` and `data.carousel.items[].video.recipes` (JSON string:
+     * locale → [{recipe, mediaRefId}]; "en-US" else the first locale; `video-fmp4` else
+     * `video-webm`, never HLS — VideoView can't play it).
+     */
+    internal fun parseProductPage(body: String): PageMedia {
+        val pages = JSONObject(body).optJSONArray("pages") ?: return PageMedia(emptyList(), emptyList())
+        var chosen: PageMedia? = null
+        for (p in 0 until pages.length()) {
+            val page = pages.optJSONObject(p) ?: continue
+            val data = page.optJSONObject("data") ?: continue
+            val shots = ArrayList<MediaImage>()
+            val gallery = data.optJSONObject("gallery")?.optJSONArray("galleryImages")
+            if (gallery != null) for (g in 0 until gallery.length()) {
+                val src = gallery.optJSONObject(g)?.optString("src").orEmpty()
+                if (src.isNotBlank() && shots.size < MAX_SHOTS) shots.add(MediaImage(thumbOf(src), src))
+            }
+            val videos = ArrayList<VideoRef>()
+            val items = data.optJSONObject("carousel")?.optJSONArray("items")
+            if (items != null) for (i in 0 until items.length()) {
+                val item = items.optJSONObject(i) ?: continue
+                val video = item.optJSONObject("video") ?: continue
+                val recipes = video.optString("recipes", "")
+                if (recipes.isBlank()) continue
+                val refId = pickRecipe(recipes) ?: continue
+                val poster = item.optJSONObject("image")?.optString("src").orEmpty().ifBlank { null }
+                val title = video.optString("title", "").trim().ifBlank { "Trailer ${videos.size + 1}" }
+                if (videos.size < MAX_VIDEOS) videos.add(VideoRef(refId, null, poster, title))
+            }
+            val media = PageMedia(shots, videos)
+            if (page.optString("_slug") == "home" && !media.isEmpty) return media
+            if (chosen == null && !media.isEmpty) chosen = media
+        }
+        return chosen ?: PageMedia(emptyList(), emptyList())
+    }
+
+    /** The `mediaRefId` to resolve out of a carousel `recipes` string, or null. */
+    private fun pickRecipe(recipes: String): String? {
+        val byLocale = runCatching { JSONObject(recipes) }.getOrNull() ?: return null
+        val arr = byLocale.optJSONArray("en-US")
+            ?: byLocale.keys().asSequence().firstOrNull()?.let { byLocale.optJSONArray(it) }
+            ?: return null
+        var webm: String? = null
+        for (r in 0 until arr.length()) {
+            val rec = arr.optJSONObject(r) ?: continue
+            val id = rec.optString("mediaRefId", "")
+            if (id.isBlank()) continue
+            when (rec.optString("recipe")) {
+                "video-fmp4" -> return id
+                "video-webm" -> if (webm == null) webm = id
+            }
+        }
+        return webm
+    }
+
+    /**
+     * Pure parser for an offer's `keyImages`: `featuredMedia` / `*Screenshot*` = screenshots,
+     * `heroCarouselVideo` = `com.epicgames.video://<uuid>?cover=<poster>` trailers. The
+     * `com.epicgames.video.qs://` form is not resolvable through the store GraphQL and is skipped.
+     */
+    internal fun parseOfferMedia(keyImages: JSONArray?): PageMedia {
+        val shots = ArrayList<MediaImage>()
+        val videos = ArrayList<VideoRef>()
+        if (keyImages != null) for (k in 0 until keyImages.length()) {
+            val img = keyImages.optJSONObject(k) ?: continue
+            val url = img.optString("url", "")
+            if (url.isBlank()) continue
+            val type = img.optString("type", "")
+            when {
+                type == "featuredMedia" || type.contains("Screenshot", ignoreCase = true) ->
+                    if (shots.size < MAX_SHOTS) shots.add(MediaImage(thumbOf(url), url))
+                type == "heroCarouselVideo" && url.startsWith(VIDEO_SCHEME) -> {
+                    val rest = url.removePrefix(VIDEO_SCHEME)
+                    val id = rest.substringBefore('?')
+                    if (!ID_CHARS.matches(id)) continue
+                    val cover = rest.substringAfter("cover=", "").substringBefore('&')
+                        .takeIf { it.isNotBlank() }?.let { runCatching { java.net.URLDecoder.decode(it, "UTF-8") }.getOrNull() }
+                    if (videos.size < MAX_VIDEOS) videos.add(VideoRef(null, id, cover, "Trailer ${videos.size + 1}"))
+                }
+                type == "heroCarouselVideo" && url.startsWith(VIDEO_SCHEME_QS) -> { /* unresolvable, see header */ }
+            }
+        }
+        return PageMedia(shots, videos)
+    }
+
+    /** Turns the page's [VideoRef]s into playable [MediaVideo]s with ONE aliased GraphQL POST. */
+    private fun resolve(page: PageMedia): StoreMedia {
+        if (page.videos.isEmpty()) return StoreMedia(page.screenshots, emptyList())
+        val q = StringBuilder("query q{")
+        page.videos.forEachIndexed { i, v ->
+            val ref = v.mediaRefId
+            val vid = v.videoId
+            when {
+                ref != null && ID_CHARS.matches(ref) ->
+                    q.append("v$i:Media{getMediaRef(mediaRefId:\"$ref\"){outputs{key url contentType}}} ")
+                vid != null && ID_CHARS.matches(vid) ->
+                    q.append("v$i:Video{fetchVideoByLocale(videoId:\"$vid\",locale:\"en-US\"){recipe mediaRef{outputs{key url contentType}}}} ")
+            }
+        }
+        q.append("}")
+        val resp = StoreNet.postJson(GRAPHQL, JSONObject().put("query", q.toString()).toString())
+        val videos = resp?.let { parseResolvedVideos(it, page.videos) }.orEmpty()
+        return StoreMedia(page.screenshots, videos)
+    }
+
+    /**
+     * Pure parser for the batched resolve response: alias `v<i>` ↔ `refs[i]`; a failed alias
+     * (null data + an `errors[]` entry) just drops that trailer.
+     */
+    internal fun parseResolvedVideos(body: String, refs: List<VideoRef>): List<MediaVideo> {
+        val data = runCatching { JSONObject(body).optJSONObject("data") }.getOrNull() ?: return emptyList()
+        val out = ArrayList<MediaVideo>()
+        refs.forEachIndexed { i, ref ->
+            val node = data.optJSONObject("v$i") ?: return@forEachIndexed
+            val outputs: JSONArray? = when {
+                ref.mediaRefId != null -> node.optJSONObject("getMediaRef")?.optJSONArray("outputs")
+                else -> {
+                    val list = node.optJSONArray("fetchVideoByLocale")
+                    var chosen: JSONObject? = null
+                    if (list != null) for (r in 0 until list.length()) {
+                        val entry = list.optJSONObject(r) ?: continue
+                        when (entry.optString("recipe")) {
+                            "video-fmp4" -> { chosen = entry; break }
+                            "video-webm" -> if (chosen == null) chosen = entry
+                        }
+                    }
+                    chosen?.optJSONObject("mediaRef")?.optJSONArray("outputs")
                 }
             }
-            out
-        }.getOrDefault(emptyList())
+            val (url, thumb) = pickOutput(outputs) ?: return@forEachIndexed
+            out.add(MediaVideo.Direct(url = url, poster = ref.poster ?: thumb, title = ref.title))
+        }
+        return out
+    }
+
+    /** (playable url, thumbnail url) from a media-service `outputs[]`, by [OUTPUT_ORDER]. */
+    private fun pickOutput(outputs: JSONArray?): Pair<String, String?>? {
+        if (outputs == null) return null
+        val byKey = HashMap<String, String>()
+        var thumb: String? = null
+        for (o in 0 until outputs.length()) {
+            val out = outputs.optJSONObject(o) ?: continue
+            val url = out.optString("url", "")
+            if (url.isBlank()) continue
+            val key = out.optString("key", "")
+            val type = out.optString("contentType", "")
+            if (key == "thumbnail") thumb = url
+            else if (type.startsWith("video/")) byKey[key] = url
+        }
+        val url = OUTPUT_ORDER.firstNotNullOfOrNull { byKey[it] } ?: byKey.values.firstOrNull() ?: return null
+        return url to thumb
     }
 
     // ── Disk mirror ───────────────────────────────────────────────────────────────────────────
