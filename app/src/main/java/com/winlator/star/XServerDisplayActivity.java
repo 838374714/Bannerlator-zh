@@ -1864,6 +1864,17 @@ public class XServerDisplayActivity extends AppCompatActivity {
             isRelativeMouseMovement = !isRelativeMouseMovement;
             state.setIsRelativeMouseMovement(isRelativeMouseMovement);
             xServer.setRelativeMouseMovement(isRelativeMouseMovement);
+            // Persist per game (issue #431): titles like ETS2 need Relative Mouse every launch, and this
+            // toggle used to live only in memory so it reset to off each session while the neighbouring
+            // Cursor to Touch survived. Same owner rule as Present Mode / the FPS limiter: write to the
+            // shortcut when launched from one (that is what the launch seed reads back), else the container.
+            if (shortcut != null) {
+                shortcut.putExtra("relativeMouse", isRelativeMouseMovement ? "1" : "0");
+                shortcut.saveData();
+            } else {
+                container.putExtra("relativeMouse", isRelativeMouseMovement ? "1" : "0");
+                container.saveData();
+            }
         };
         state.onDisableMouse           = () -> {
             isMouseDisabled = !isMouseDisabled;
@@ -2377,6 +2388,20 @@ public class XServerDisplayActivity extends AppCompatActivity {
         xServer = new XServer(new ScreenInfo(screenSize));
         xServer.setWinHandler(winHandler);
         advertisePanelRefreshRates();
+
+        // Restore the saved Relative Mouse state for this game (issue #431). Read from the same owner
+        // the drawer toggle writes to: shortcut extra first (per-game), container extra as the fallback.
+        // The drawer state was seeded with the in-memory default before the shortcut existed, so echo
+        // the restored value back to it here; pointer capture itself is (re)requested on window focus.
+        {
+            String savedRelMouse = container.getExtra("relativeMouse", "0");
+            if (shortcut != null) savedRelMouse = shortcut.getExtra("relativeMouse", savedRelMouse);
+            if ("1".equals(savedRelMouse)) {
+                isRelativeMouseMovement = true;
+                xServer.setRelativeMouseMovement(true);
+                XServerDrawerState.INSTANCE.setIsRelativeMouseMovement(true);
+            }
+        }
 
         // Add the OnWindowModificationListener for dynamic workarounds
         xServer.windowManager.addOnWindowModificationListener(new WindowManager.OnWindowModificationListener() {
