@@ -5934,6 +5934,9 @@ public class XServerDisplayActivity extends AppCompatActivity {
         com.winlator.star.core.PreloaderState.setOnClose(null);
         com.winlator.star.core.PreloaderState.setOnOpenLog(null);
         com.winlator.star.core.PreloaderState.setOnCancel(null);
+        // A failure card that outlives this activity (Close -> finish, or a recents swipe) would keep
+        // showing on MainActivity's copy of the overlay with no owner to act on Close. Clear it.
+        com.winlator.star.core.PreloaderState.hideIfFailed();
         if (wineDebugLogCallback != null) {
             ProcessHelper.removeDebugCallback(wineDebugLogCallback);
             wineDebugLogCallback = null;

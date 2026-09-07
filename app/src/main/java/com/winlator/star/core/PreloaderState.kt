@@ -118,5 +118,22 @@ object PreloaderState {
     }
 
     @JvmStatic fun hide() { _ui.value = null }
+
+    /**
+     * Failure-card Close. Runs the owning activity's callback (finish) if one is still registered,
+     * then clears the shared state. The state is app-wide and the same overlay is composed in
+     * MainActivity too, so a card left in FAILED after the game activity finished (or was swiped
+     * away, which never runs its callbacks) kept showing on the Games screen with an inert Close —
+     * the only way out was killing the app. Clearing here fixes both paths.
+     */
+    @JvmStatic fun close() {
+        onClose?.run()
+        hide()
+    }
+
+    /** Clear a lingering failure card only (used from the game activity's teardown). */
+    @JvmStatic fun hideIfFailed() {
+        if (_ui.value?.phase == Phase.FAILED) _ui.value = null
+    }
     @JvmStatic fun isVisible(): Boolean = _ui.value != null
 }
