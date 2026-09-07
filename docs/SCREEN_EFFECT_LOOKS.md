@@ -121,6 +121,13 @@ and the on-disk `screen_effect_profiles` format is deliberately **unchanged** �
 saved profiles carry brightness/contrast/gamma and the shader flags as they always
 have, and load with saturation at neutral.
 
+Note that a Look rides the existing appliers, so it inherits whatever they already
+persist: `onSgsrUpdate` / `onCasApply` remember the sharpening toggle and level per
+game (#382), `onDebandApply` remembers debanding, and `onGlUpscalerApply` /
+`onUpscalerApply` remember the scaling mode. That is unchanged behaviour of those
+callbacks — no new save keys, no format change — and it is why a Look's sharpening
+and scaling survive a relaunch while its colour grade does not.
+
 ## Layout
 
 The drawer is a fixed-width shell (`380.dp` = a `60.dp` rail + a `1.5.dp` seam +
