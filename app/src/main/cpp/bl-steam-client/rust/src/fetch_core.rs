@@ -624,6 +624,24 @@ pub fn classify_status(status: u16) -> FetchFailKind {
     }
 }
 
+/// The HTTP status carried by a `send_checked` rejection message, if that is what the error was.
+/// A 4xx other than 429 is a CLIENT rejection (bad/expired signed URL, wrong host for this path,
+/// 404): it says nothing about congestion, so the driver demotes the host but does not shrink the
+/// shared window for it — one CDN that refuses a path must not throttle the healthy ones.
+pub fn rejected_status(message: &str) -> Option<u16> {
+    let rest = message.strip_prefix("unexpected HTTP status (")?;
+    let digits = rest.strip_suffix(')')?;
+    digits.parse().ok()
+}
+
+pub fn is_client_rejection(message: &str) -> bool {
+    matches!(rejected_status(message), Some(s) if (400..500).contains(&s) && s != 429)
+}
+
+/// How many individual fetch failures a run logs verbatim before going quiet (the window and
+/// throughput lines keep reporting the aggregate).
+pub const FETCH_ERROR_LOG_LIMIT: u32 = 12;
+
 fn record_first_error(slot: &Mutex<Option<String>>, err: String) {
     let mut guard = slot.lock().expect("err slot poisoned");
     if guard.is_none() {
@@ -962,6 +980,7 @@ async fn run_driver(ctx: DriverCtx<'_>) {
     let mut sched = FetchScheduler::new(hosts, per_host_cap);
     let mut retry: VecDeque<PendingItem> = VecDeque::new();
     let mut next_item = 0usize;
+    let mut errors_logged: u32 = 0;
     // Bodies / finishes handed to the pool whose verdict has not come back yet.
     let mut outstanding = 0usize;
     // Declared AFTER `txs`/`http` so it is dropped BEFORE them (its futures borrow both).
@@ -1171,8 +1190,27 @@ async fn run_driver(ctx: DriverCtx<'_>) {
             }
             Err(err) => {
                 in_flight.fetch_sub(done.reserve, Ordering::Relaxed);
+                let client_rejection = is_client_rejection(&err.message);
+                if errors_logged < FETCH_ERROR_LOG_LIMIT {
+                    errors_logged += 1;
+                    let host = hosts.get(done.server_idx).map(String::as_str).unwrap_or("?");
+                    log(&format!(
+                        "fetch-error label={label} item={} host={host} attempt={} kind={:?} \
+window_shrink={} msg={}",
+                        items[done.idx].id,
+                        done.attempts,
+                        err.kind,
+                        !client_rejection,
+                        err.message
+                    ));
+                    if errors_logged == FETCH_ERROR_LOG_LIMIT {
+                        log(&format!(
+                            "fetch-error label={label} further errors not logged individually"
+                        ));
+                    }
+                }
                 sched.on_error(done.server_idx, now, err.kind);
-                if window.record_err(now, err.kind) {
+                if !client_rejection && window.record_err(now, err.kind) {
                     log(&window.summary_line(label, inflight.len(), now));
                 }
                 if done.attempts < MAX_ITEM_ATTEMPTS {
@@ -1695,6 +1733,17 @@ phase={} rtt={:.0}ms budget_stalls={} host_stalls={}",
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn client_rejection_is_4xx_but_not_429() {
+        assert_eq!(rejected_status("unexpected HTTP status (403)"), Some(403));
+        assert!(is_client_rejection("unexpected HTTP status (403)"));
+        assert!(is_client_rejection("unexpected HTTP status (404)"));
+        assert!(!is_client_rejection("unexpected HTTP status (429)"));
+        assert!(!is_client_rejection("unexpected HTTP status (503)"));
+        assert!(!is_client_rejection("http get: connection reset"));
+        assert_eq!(rejected_status("http body: timeout"), None);
+    }
+
     use super::*;
     use crate::depot_writer::{
         FETCH_INFLIGHT_BUDGET_FLOOR_BYTES, FETCH_INFLIGHT_BUDGET_HARD_CAP_BYTES, PER_HOST_CAP,
