@@ -42,6 +42,7 @@ pub struct EpicRequest {
 }
 
 /// The chunk plan for one run.
+#[derive(Debug)]
 pub struct EpicPlan {
     pub manifest: Manifest,
     pub cache_dir: PathBuf,
