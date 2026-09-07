@@ -22,9 +22,11 @@ import java.net.URL;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.concurrent.Callable;
+import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.Future;
+import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicLong;
@@ -331,6 +333,9 @@ public final class GogDownloadManager {
             // Collect DepotFiles from each language-compatible BASE depot
             cb.onProgress("Reading depot manifests…", 10);
             List<DepotFile> files = new ArrayList<>();
+            // The same inflated depot manifests, kept for the Rust engine (it parses them with the
+            // same rules as parseDepotManifest — see docs/RUST_GOG_PARITY.md §3).
+            List<String> depotJsons = new ArrayList<>();
             int baseDepotCount = 0, skippedDlcDepotCount = 0;
             for (int i = 0; i < depots.length(); i++) {
                 JSONObject depot = depots.getJSONObject(i);
@@ -372,6 +377,7 @@ public final class GogDownloadManager {
                    .append(dmStr.substring(0, Math.min(500, dmStr.length()))).append("\n");
                 int before = files.size();
                 parseDepotManifest(dmStr, files);
+                depotJsons.add(dmStr);
                 dbg.append("depot[").append(i).append("] added ").append(files.size() - before).append(" files\n");
             }
 
@@ -443,6 +449,20 @@ public final class GogDownloadManager {
             dbg.append("gen2 parallel download: ").append(total)
                .append(" files, ").append(downloadThreads).append(" threads (largest-first)\n");
 
+            // Engine switch (docs/RUST_GOG_PARITY.md): the Rust engine replaces ONLY this
+            // fetch/inflate/verify/assemble loop. Same resume/skip rule, same .bhtmp staging +
+            // atomic rename, same progress strings + pct math, same secure-link refresh cap,
+            // same anyFailed / cancelled semantics — everything before and after is shared.
+            final boolean useRustEngine = useRustEngine(ctx);
+            dbg.append("engine=").append(useRustEngine ? "rust" : "java").append("\n");
+            if (useRustEngine) {
+                runRustChunkEngine(ctx, com.winlator.star.store.blsteam.BlGogDownload.KIND_GEN2_CHUNKS,
+                        "Verified…", depotJsons, installPath,
+                        cdnBaseRef, fSecureLinkUrl, token, cdnRefreshCount, MAX_CDN_REFRESH,
+                        downloadThreads, downloadThreads, true, "gog base=" + baseProductId,
+                        cancelled, anyFailed, doneCount, total, totalBytes,
+                        lastSpeedMs, lastSpeedB, speedBps, cb, true, null, fileLog2);
+            } else {
             ExecutorService pool = Executors.newFixedThreadPool(downloadThreads);
             List<Future<Void>> futures = new ArrayList<>();
             for (DepotFile df : files) {
@@ -499,6 +519,7 @@ public final class GogDownloadManager {
                 pool.shutdownNow();
                 return "parallel download error: " + e;
             }
+            } // end Java engine
             for (String line : fileLog2) dbg.append(line).append("\n");
             if (cancelled.get()) return "cancelled";
             if (anyFailed.get()) return "one or more chunks failed to download";
@@ -685,6 +706,7 @@ public final class GogDownloadManager {
             // Collect the DLC's own depots (productId == dlcProductId) + language compat.
             cb.onProgress("Reading DLC manifests…", 8);
             List<DepotFile> files = new ArrayList<>();
+            List<String> depotJsons = new ArrayList<>();   // for the Rust engine (same strings)
             int matched = 0;
             for (int i = 0; i < depots.length(); i++) {
                 if (cancelled.get()) return;
@@ -701,6 +723,7 @@ public final class GogDownloadManager {
                 String dmStr = decompressBytes(dmRaw);
                 if (dmStr == null) continue;
                 parseDepotManifest(dmStr, files);
+                depotJsons.add(dmStr);
             }
             GogCloudSaveManager.debug(ctx, dlgTag + " depots matched=" + matched + " files=" + files.size());
 
@@ -761,6 +784,18 @@ public final class GogDownloadManager {
             final java.util.concurrent.ConcurrentLinkedQueue<String> written =
                     new java.util.concurrent.ConcurrentLinkedQueue<>();
 
+            // Engine switch — see runGen2. DLC: fixed 8 workers, manifest order, no speed string.
+            final boolean useRustEngine = useRustEngine(ctx);
+            GogCloudSaveManager.debug(ctx, dlgTag + " engine=" + (useRustEngine ? "rust" : "java"));
+            if (useRustEngine) {
+                runRustChunkEngine(ctx, com.winlator.star.store.blsteam.BlGogDownload.KIND_GEN2_CHUNKS,
+                        "Verified…", depotJsons, fInstallPath,
+                        cdnBaseRef, fSecureLinkUrl, fToken, cdnRefreshCount, MAX_CDN_REFRESH,
+                        8, 8, false, "gog dlc=" + dlcProductId + " base=" + baseId,
+                        cancelled, anyFailed, doneCount, total, new AtomicLong(0),
+                        new AtomicLong(System.currentTimeMillis()), new AtomicLong(0), new AtomicLong(0),
+                        cb, false, written, fileLog);
+            } else {
             ExecutorService pool = Executors.newFixedThreadPool(8);
             List<Future<Void>> futures = new ArrayList<>();
             for (DepotFile df : files) {
@@ -803,6 +838,7 @@ public final class GogDownloadManager {
                 cb.onError("DLC install failed: " + e.getMessage());
                 return;
             }
+            } // end Java engine
             for (String line : fileLog) GogCloudSaveManager.debug(ctx, dlgTag + " " + line);
 
             if (cancelled.get()) { GogCloudSaveManager.debug(ctx, dlgTag + " cancelled"); return; }
@@ -917,6 +953,18 @@ public final class GogDownloadManager {
             dbg.append("gen1 parallel download: ").append(totalG1)
                .append(" files, ").append(downloadThreadsG1).append(" threads\n");
 
+            // Engine switch — see runGen2. gen1: one Range GET per file streamed to disk, size-only
+            // resume ("Resuming…"), no secure-link refresh (cap 0), same speed string.
+            final boolean useRustEngineG1 = useRustEngine(ctx);
+            dbg.append("engine=").append(useRustEngineG1 ? "rust" : "java").append("\n");
+            if (useRustEngineG1) {
+                runRustChunkEngine(ctx, com.winlator.star.store.blsteam.BlGogDownload.KIND_GEN1_RANGES,
+                        "Resuming…", java.util.Collections.singletonList(manifestStr), installPath,
+                        new AtomicReference<>(""), null, null, new AtomicInteger(0), 0,
+                        downloadThreadsG1, downloadThreadsG1, false, "gog gen1=" + game.gameId,
+                        cancelled, anyFailedG1, doneG1, totalG1, totalBytesG1,
+                        lastSpeedMsG1, lastSpeedBG1, speedBpsG1, cb, true, null, fileLog1);
+            } else {
             ExecutorService poolG1 = Executors.newFixedThreadPool(downloadThreadsG1);
             List<Future<Void>> futuresG1 = new ArrayList<>();
             for (Gen1File gf : files) {
@@ -974,6 +1022,7 @@ public final class GogDownloadManager {
                 poolG1.shutdownNow();
                 return "gen1 parallel error: " + e;
             }
+            } // end Java engine
             for (String line : fileLog1) dbg.append(line).append("\n");
             if (cancelled.get()) return "cancelled";
             if (anyFailedG1.get()) return "one or more gen1 files failed to download";
@@ -1345,6 +1394,33 @@ public final class GogDownloadManager {
 
             String wantTail = exeRelPath == null ? null
                     : exeRelPath.replace("\\", "/").replaceFirst("^/+", "");
+
+            // Engine switch — see runGen2. No Context reaches this entry point (GogRedistInstaller
+            // calls it), so the flag is read through the registry's application Context; when
+            // that is not initialised yet the Java assembler runs, as before.
+            Context engineCtx = com.winlator.star.store.download.DownloadRegistry.INSTANCE.appContext();
+            if (engineCtx != null && useRustEngine(engineCtx)) {
+                log.add("engine=rust (dependency)");
+                AtomicBoolean anyFailed = new AtomicBoolean(false);
+                runRustChunkEngine(engineCtx, com.winlator.star.store.blsteam.BlGogDownload.KIND_GEN2_CHUNKS,
+                        "Verified…", java.util.Collections.singletonList(depManifestJson), destDir,
+                        baseRef, null, null, refresh, 0,
+                        1, 1, false, "gog dep=" + (wantTail == null ? "?" : wantTail),
+                        cancelled, anyFailed, new AtomicInteger(0), files.size(), new AtomicLong(0),
+                        new AtomicLong(System.currentTimeMillis()), new AtomicLong(0), new AtomicLong(0),
+                        null, false, null, log);
+                if (cancelled.get() || anyFailed.get()) {
+                    log.add("dep chunk assembly failed (rust engine)");
+                    return null;
+                }
+                File rustExeOut = null;
+                for (DepotFile df : files) {
+                    File outFile = new File(destDir, df.relativePath);
+                    if (wantTail != null && df.relativePath.endsWith(wantTail)) rustExeOut = outFile;
+                    if (rustExeOut == null) rustExeOut = outFile; // fallback: first file
+                }
+                return rustExeOut;
+            }
             File exeOut = null;
             for (DepotFile df : files) {
                 File outFile = new File(destDir, df.relativePath);
@@ -1692,6 +1768,161 @@ public final class GogDownloadManager {
             return inflated;
         }
         return null;
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // Rust fetch engine (gen2 chunk path) — docs/RUST_GOG_PARITY.md
+    // ─────────────────────────────────────────────────────────────────────────
+
+    /**
+     * True when the Rust GOG engine flag is ON and {@code libblsteam.so} loads with its GOG JNI
+     * exports bound. Any failure degrades to the Java loop (never throws).
+     */
+    private static boolean useRustEngine(Context ctx) {
+        try {
+            return ctx != null
+                    && com.winlator.star.store.blsteam.BlStoreEngineFlag.isGogEnabled(ctx)
+                    && com.winlator.star.store.blsteam.BlGogDownload.isAvailable();
+        } catch (Throwable t) {
+            Log.w(TAG, "rust engine unavailable: " + t);
+            return false;
+        }
+    }
+
+    /**
+     * Drives the Rust engine for ONE fetch loop ({@code kind} = gen2 chunk loop for base install /
+     * DLC install / dependency redist assembly, or the gen1 range loop), producing exactly what
+     * the Java pool loop produced:
+     * <ul>
+     *   <li>per verified (resume-skipped) file: {@code doneCount++}, {@code verifiedMsg}
+     *       ({@code "Verified…"} gen2 / {@code "Resuming…"} gen1) at {@code 15 + done/total*80};</li>
+     *   <li>per assembled file: {@code doneCount++}, {@code totalBytes += size}, the same 500 ms
+     *       speed window and {@code "Downloading: <name>  <speed>"} string;</li>
+     *   <li>the DLC written-file list gets both kinds, like the Java tasks;</li>
+     *   <li>engine log lines go to the same debug buffer as the Java {@code fileLog};</li>
+     *   <li>secure-link expiry (a run dying on HTTP 401/403/404/500) → {@link #tryRefreshCdn} with
+     *       the SAME counter/cap, then a re-run for the files not yet done (the engine is told which
+     *       paths are already complete so they are neither re-hashed nor re-reported);</li>
+     *   <li>any other failure → {@code anyFailed = true} (the caller's "one or more chunks failed"
+     *       path); cancel → returns with {@code cancelled} left as the caller set it.</li>
+     * </ul>
+     * Cancel is propagated by polling the caller's {@code cancelled} flag every 250 ms.
+     */
+    private static void runRustChunkEngine(
+            Context ctx, int kind, String verifiedMsg,
+            List<String> depotJsons, File installPath,
+            AtomicReference<String> cdnBaseRef, String secureLinkUrl, String token,
+            AtomicInteger cdnRefreshCount, int maxCdnRefresh,
+            int maxWorkers, int processWorkers, boolean sortLargestFirst, String label,
+            AtomicBoolean cancelled, AtomicBoolean anyFailed,
+            AtomicInteger doneCount, int total, AtomicLong totalBytes,
+            AtomicLong lastSpeedMs, AtomicLong lastSpeedB, AtomicLong speedBps,
+            Callback cb, boolean showSpeed,
+            java.util.Collection<String> written,
+            java.util.concurrent.ConcurrentLinkedQueue<String> log) {
+        final String caPath;
+        try {
+            caPath = com.winlator.star.store.blsteam.CaBundleExtractor.INSTANCE.ensureBundle(ctx);
+        } catch (Throwable t) {
+            log.add("rust engine: CA bundle unavailable: " + t);
+            anyFailed.set(true);
+            return;
+        }
+        final String[] manifests = depotJsons.toArray(new String[0]);
+        // Files completed by earlier runs of THIS download (refresh re-runs skip them silently).
+        final java.util.Set<String> donePaths = java.util.concurrent.ConcurrentHashMap.newKeySet();
+        int run = 0;
+        while (!cancelled.get()) {
+            run++;
+            final String base = cdnBaseRef.get();
+            final CountDownLatch latch = new CountDownLatch(1);
+            final AtomicBoolean okRef = new AtomicBoolean(false);
+            final AtomicBoolean linkExpiryRef = new AtomicBoolean(false);
+            final AtomicReference<String> errRef = new AtomicReference<>("");
+            com.winlator.star.store.blsteam.BlGogDownloadListener listener =
+                    new com.winlator.star.store.blsteam.BlGogDownloadListener() {
+                @Override
+                public void onProgress(long bytesDone, long bytesTotal, int filesDone, int filesTotal,
+                                       String file, long fileBytes, boolean verified) {
+                    donePaths.add(file);
+                    if (written != null) written.add(file);
+                    int done = doneCount.incrementAndGet();
+                    int pct  = 15 + (int) ((done / (float) total) * 80);
+                    if (verified) {
+                        if (cb != null) cb.onProgress(verifiedMsg, pct);
+                        return;
+                    }
+                    long tb = totalBytes.addAndGet(fileBytes);
+                    String speedStr = "";
+                    if (showSpeed) {
+                        long nowMs  = System.currentTimeMillis();
+                        long prevMs = lastSpeedMs.get();
+                        if (nowMs - prevMs >= 500 && lastSpeedMs.compareAndSet(prevMs, nowMs)) {
+                            long prevB = lastSpeedB.getAndSet(tb);
+                            long dt = nowMs - prevMs;
+                            if (dt > 0) speedBps.set((tb - prevB) * 1000L / dt);
+                        }
+                        speedStr = formatSpeed(speedBps.get());
+                    }
+                    String name = file.contains("/")
+                            ? file.substring(file.lastIndexOf('/') + 1) : file;
+                    if (cb != null) cb.onProgress("Downloading: " + name
+                            + (speedStr.isEmpty() ? "" : "  " + speedStr), pct);
+                }
+                @Override
+                public void onLog(String line) { log.add(line); }
+                @Override
+                public void onComplete(boolean success, boolean wasCancelled, boolean linkExpiry,
+                                       String error, long bytesWritten, int filesDone) {
+                    okRef.set(success);
+                    linkExpiryRef.set(linkExpiry);
+                    errRef.set(error == null ? "" : error);
+                    latch.countDown();
+                }
+            };
+            long handle = com.winlator.star.store.blsteam.BlGogDownload.start(
+                    kind, manifests, base, installPath.getAbsolutePath(),
+                    donePaths.toArray(new String[0]), caPath,
+                    maxWorkers, processWorkers, sortLargestFirst, label + " run=" + run, listener);
+            if (handle == 0L) {
+                log.add("rust engine: start failed (see logcat BL_GOG_DL)");
+                anyFailed.set(true);
+                return;
+            }
+            boolean interrupted = false;
+            try {
+                while (true) {
+                    try {
+                        if (latch.await(250, TimeUnit.MILLISECONDS)) break;
+                    } catch (InterruptedException ie) {
+                        interrupted = true;
+                    }
+                    if (cancelled.get() || interrupted) {
+                        com.winlator.star.store.blsteam.BlGogDownload.cancel(handle);
+                    }
+                }
+            } finally {
+                com.winlator.star.store.blsteam.BlGogDownload.release(handle);
+            }
+            if (interrupted) {
+                Thread.currentThread().interrupt();
+                log.add("rust engine: interrupted");
+                anyFailed.set(true);
+                return;
+            }
+            if (cancelled.get()) return;
+            if (okRef.get()) return;
+            String err = errRef.get();
+            if (linkExpiryRef.get() && tryRefreshCdn(cdnBaseRef, base, secureLinkUrl, token,
+                    cdnRefreshCount, maxCdnRefresh, log)) {
+                log.add("rust engine: secure-link expiry (" + err
+                        + ") — refreshed, re-running for the remaining files");
+                continue;
+            }
+            log.add("rust engine FAILED: " + err);
+            anyFailed.set(true);
+            return;
+        }
     }
 
     private static void writeFile(File f, byte[] data) throws IOException {
