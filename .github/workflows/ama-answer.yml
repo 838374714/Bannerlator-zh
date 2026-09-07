@@ -21,9 +21,15 @@ permissions:
   issues: write
   contents: read
 
+# One group per issue AND per event: an issue created WITH a label (the form
+# template, or `gh issue create --label`) fires `opened` and `labeled` a second
+# apart. With a single per-issue group + cancel-in-progress, the `labeled` run
+# cancelled the real `opened` run and was then itself skipped by the job `if`,
+# so the issue never got an answer. Keying the group on the action/label keeps
+# the two apart; queueing (not cancelling) covers any remaining overlap.
 concurrency:
-  group: ama-${{ github.event.issue.number }}
-  cancel-in-progress: true
+  group: ama-${{ github.event.issue.number }}-${{ github.event.action }}-${{ github.event.label.name }}
+  cancel-in-progress: false
 
 jobs:
   answer:
