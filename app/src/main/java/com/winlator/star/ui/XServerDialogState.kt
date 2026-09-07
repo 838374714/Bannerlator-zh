@@ -192,6 +192,12 @@ object XServerDialogState {
     val vkGamma: StateFlow<Float> = _vkGamma
     fun setVkGamma(v: Float) { _vkGamma.value = v }
 
+    // Saturation is expressed in percent (0..200) so it reads like the other grade
+    // sliders; 100 = neutral. The renderer divides by 100 for the shader's [0,2] mix.
+    private val _vkSaturation = MutableStateFlow(100f)     // 0..200, 100 = neutral
+    val vkSaturation: StateFlow<Float> = _vkSaturation
+    fun setVkSaturation(v: Float) { _vkSaturation.value = v }
+
     private val _vkFxaa = MutableStateFlow(false)
     val vkFxaa: StateFlow<Boolean> = _vkFxaa
     fun setVkFxaa(v: Boolean) { _vkFxaa.value = v }
@@ -208,9 +214,10 @@ object XServerDialogState {
     val vkNtsc: StateFlow<Boolean> = _vkNtsc
     fun setVkNtsc(v: Boolean) { _vkNtsc.value = v }
 
-    // Single applier mirroring the GL onScreenEffectsApply signature.
+    // Single applier mirroring the GL onScreenEffectsApply signature. `saturation` is
+    // the 0..200 percent slider (100 = neutral), same units as vkSaturation above.
     fun interface VulkanScreenEffectsCallback {
-        fun invoke(brightness: Float, contrast: Float, gamma: Float,
+        fun invoke(brightness: Float, contrast: Float, gamma: Float, saturation: Float,
                    fxaa: Boolean, toon: Boolean, crt: Boolean, ntsc: Boolean)
     }
     @JvmField var onVulkanScreenEffectsApply: VulkanScreenEffectsCallback? = null
@@ -728,6 +735,11 @@ object XServerDialogState {
     private val _seGamma           = MutableStateFlow(1.0f)
     val seGamma: StateFlow<Float> = _seGamma
 
+    // 0..200 percent, 100 = neutral (see vkSaturation for the same convention on the
+    // Vulkan side). ColorEffect divides by 100 for its [0,2] luma-preserving mix.
+    private val _seSaturation      = MutableStateFlow(100f)
+    val seSaturation: StateFlow<Float> = _seSaturation
+
     private val _seFxaa            = MutableStateFlow(false)
     val seFxaa: StateFlow<Boolean> = _seFxaa
 
@@ -749,6 +761,7 @@ object XServerDialogState {
     fun setSeBrightness(v: Float)   { _seBrightness.value = v }
     fun setSeContrast(v: Float)     { _seContrast.value = v }
     fun setSeGamma(v: Float)        { _seGamma.value = v }
+    fun setSeSaturation(v: Float)   { _seSaturation.value = v }
     fun setSeFxaa(v: Boolean)       { _seFxaa.value = v }
     fun setSeCrt(v: Boolean)        { _seCrt.value = v }
     fun setSeToon(v: Boolean)       { _seToon.value = v }
@@ -758,7 +771,7 @@ object XServerDialogState {
 
     fun interface ScreenEffectsApplyCallback {
         fun invoke(
-            brightness: Float, contrast: Float, gamma: Float,
+            brightness: Float, contrast: Float, gamma: Float, saturation: Float,
             fxaa: Boolean, crt: Boolean, toon: Boolean, ntsc: Boolean,
             profileIndex: Int
         )
@@ -911,6 +924,7 @@ object XServerDialogState {
         _vkBrightness.value    = 0f
         _vkContrast.value      = 0f
         _vkGamma.value         = 1.0f
+        _vkSaturation.value    = 100f
         _vkFxaa.value          = false
         _vkToon.value          = false
         _vkCrt.value           = false
@@ -949,6 +963,7 @@ object XServerDialogState {
         _seBrightness.value    = 0f
         _seContrast.value      = 0f
         _seGamma.value         = 1.0f
+        _seSaturation.value    = 100f
         _seFxaa.value          = false
         _seCrt.value           = false
         _seToon.value          = false

@@ -2135,6 +2135,7 @@ void VulkanRendererContext::planUpscaleFrame() {
             ColorPushConstants& c=upFrame.colorPC;
             c.ndc[0]=full[0]; c.ndc[1]=full[1]; c.ndc[2]=full[2]; c.ndc[3]=full[3];
             c.brightness=colorBrightness; c.contrast=colorContrast; c.gamma=colorGamma;
+            c.saturation=colorSaturation;
         }
         if (casOn) {
             CasPushConstants& c=upFrame.casPC;
@@ -2878,16 +2879,20 @@ void VulkanRendererContext::setNtsc(bool enabled) {
 }
 
 // Color grade: inputs are GL slider values (brightness/contrast -100..100, gamma
-// 0.5..3.0). Replicate ColorEffect: map slider/100 then apply ColorEffectMaterial.use()
-// clamps; "enabled" only when not at the neutral (0,0,1) grade (GL removes it then).
-void VulkanRendererContext::setColorGrade(float brightness, float contrast, float gamma) {
-    bool enabled = !(brightness==0.0f && contrast==0.0f && gamma==1.0f);
+// 0.5..3.0, saturation 0..200 percent). Replicate ColorEffect: map slider/100 then apply
+// ColorEffectMaterial.use() clamps; "enabled" only when not at the neutral (0,0,1,100)
+// grade (GL removes it then) — saturation is part of that neutral test, so a Look that
+// only moves saturation still switches the Color pass on.
+void VulkanRendererContext::setColorGrade(float brightness, float contrast, float gamma, float saturation) {
+    bool enabled = !(brightness==0.0f && contrast==0.0f && gamma==1.0f && saturation==100.0f);
     float b = brightness / 100.0f; if (b<-1.0f) b=-1.0f; if (b>1.0f) b=1.0f;
     float c = contrast   / 100.0f; if (c< 0.0f) c= 0.0f; if (c>2.0f) c=2.0f;
+    float s = saturation / 100.0f; if (s< 0.0f) s= 0.0f; if (s>2.0f) s=2.0f;
     float g = gamma;               if (g< 0.1f) g= 0.1f; if (g>5.0f) g=5.0f;
-    if (colorEnabled==enabled && colorBrightness==b && colorContrast==c && colorGamma==g) return;
-    RLOG("setColorGrade: en=%d b=%.3f c=%.3f g=%.3f", (int)enabled, b, c, g);
-    colorEnabled=enabled; colorBrightness=b; colorContrast=c; colorGamma=g;
+    if (colorEnabled==enabled && colorBrightness==b && colorContrast==c && colorGamma==g &&
+        colorSaturation==s) return;
+    RLOG("setColorGrade: en=%d b=%.3f c=%.3f g=%.3f s=%.3f", (int)enabled, b, c, g, s);
+    colorEnabled=enabled; colorBrightness=b; colorContrast=c; colorGamma=g; colorSaturation=s;
     needsRender.store(true); dirtyCV.notify_one();
 }
 

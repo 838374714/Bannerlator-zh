@@ -186,11 +186,14 @@ struct ToonPushConstants {                 // 24 bytes
     float ndc[4];
     float resolution[2];                   // input texture size in px
 };
-struct ColorPushConstants {                // 28 bytes
+struct ColorPushConstants {                // 32 bytes
     float ndc[4];
     float brightness;                      // additive [-1,1]
     float contrast;                        // [0,2]
     float gamma;                           // [0.1,5]
+    float saturation;                      // [0,2]; 1 = unchanged, 0 = greyscale.
+                                           // APPENDED last so the three offsets above
+                                           // stay where color.frag already had them.
 };
 struct NtscPushConstants {                 // 28 bytes
     float ndc[4];
@@ -276,7 +279,7 @@ public:
     void setToon(bool enabled);
     void setCrt(bool enabled);
     void setNtsc(bool enabled);
-    void setColorGrade(float brightness, float contrast, float gamma);
+    void setColorGrade(float brightness, float contrast, float gamma, float saturation);
     void setSwapRB(bool enabled);
     void setPresentMode(VkPresentModeKHR mode);
     std::vector<int> getSupportedPresentModes() const;
@@ -450,6 +453,7 @@ private:
     float             colorBrightness   = 0.0f;    // [-1,1] (slider/100, clamped)
     float             colorContrast     = 0.0f;    // [0,2]  (slider/100, clamped)
     float             colorGamma        = 1.0f;    // [0.1,5]
+    float             colorSaturation   = 1.0f;    // [0,2]  (slider/100, clamped)
     uint32_t          ntscFrameCounter  = 0;       // animates NTSC chroma phase
 
     VkSampler         upscaleSampler    = VK_NULL_HANDLE; // linear clamp; offscreen/mid input
