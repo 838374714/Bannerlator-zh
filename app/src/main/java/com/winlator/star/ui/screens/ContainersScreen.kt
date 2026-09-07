@@ -735,9 +735,7 @@ private fun ContainerItem(
                         Spacer(Modifier.width(6.dp))
                         IconButton(
                             onClick = { onLayerHelp(layerUpdate) },
-                            modifier = Modifier
-                                .size(26.dp)
-                                .border(1.dp, layerOutline, CircleShape),
+                            modifier = Modifier.size(26.dp),
                         ) {
                             Icon(
                                 imageVector = Icons.Filled.HelpOutline,
