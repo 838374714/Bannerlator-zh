@@ -26,6 +26,7 @@ import androidx.compose.foundation.verticalScroll
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableStateOf
@@ -46,7 +47,9 @@ import com.winlator.star.store.download.DownloadState
 import com.winlator.star.store.download.DownloadsButton
 import com.winlator.star.store.download.INSTALLED_GREEN
 import com.winlator.star.store.download.InfoChip
+import com.winlator.star.store.download.MediaTab
 import com.winlator.star.store.download.Store
+import com.winlator.star.store.download.StoreMedia
 import com.winlator.star.store.download.StoreActionButton
 import com.winlator.star.store.download.StoreActionRow
 import com.winlator.star.store.download.StoreBadge
@@ -64,6 +67,7 @@ import com.winlator.star.ui.theme.WinlatorTheme
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.flow.collect
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
 import org.json.JSONObject
 import androidx.lifecycle.lifecycleScope
 import java.io.File
@@ -909,7 +913,29 @@ private fun EpicGameDetailScreen(
         if (dlcJson.isNullOrEmpty() || dlcJson == "[]") null else runCatching { org.json.JSONArray(dlcJson) }.getOrNull()
     }
     val dlcCount = dlcArr?.length() ?: 0
-    val tabs = listOf("Details", "DLC", "Cloud saves")
+
+    // Media tab: the store offer for this library game (namespace + catalogItemId) → screenshots
+    // and trailers, through the shared cache so a re-open / rotation paints without a request.
+    // A failed lookup is cached as a short-TTL miss (retried next open); a title with nothing is
+    // remembered for hours. The tab is offered only once something is there.
+    var media by remember { mutableStateOf<StoreMedia?>(null) }
+    var mediaLoading by remember { mutableStateOf(true) }
+    LaunchedEffect(namespace, catalogItemId) {
+        if (namespace.isBlank() || catalogItemId.isBlank()) { mediaLoading = false; return@LaunchedEffect }
+        media = withContext(Dispatchers.IO) {
+            StoreMediaCache.get(context, Store.EPIC, catalogItemId) ?: run {
+                val fetched = EpicStoreCatalog.libraryGameMedia(namespace, catalogItemId)
+                (fetched ?: StoreMedia.EMPTY).also {
+                    StoreMediaCache.put(context, Store.EPIC, catalogItemId, it, miss = fetched == null)
+                }
+            }
+        }
+        mediaLoading = false
+    }
+    val hasMedia = media?.isEmpty == false
+    // Appended LAST so the Details / DLC / Cloud saves indices never move.
+    val tabs = if (hasMedia) listOf("Details", "DLC", "Cloud saves", "Media") else listOf("Details", "DLC", "Cloud saves")
+    if (tab >= tabs.size) tab = 0
 
     StoreDetailScaffold(
         onBack = onBack,
@@ -943,7 +969,10 @@ private fun EpicGameDetailScreen(
         tabs = tabs,
         selectedTab = tab,
         onSelectTab = { tab = it },
-        tabBadges = if (dlcCount > 0) mapOf(1 to "$dlcCount") else emptyMap(),
+        tabBadges = buildMap {
+            if (dlcCount > 0) put(1, "$dlcCount")
+            media?.takeIf { hasMedia }?.let { put(3, "${it.count}") }
+        },
     ) {
         when (tab) {
             0 -> Column(modifier = Modifier.padding(bottom = 8.dp)) {
@@ -1067,7 +1096,7 @@ private fun EpicGameDetailScreen(
                 }
             }
 
-            else -> Column(modifier = Modifier.padding(top = 6.dp, bottom = 8.dp)) {
+            2 -> Column(modifier = Modifier.padding(top = 6.dp, bottom = 8.dp)) {
                 StoreSection(title = "Cloud Saves") {
                     Row(
                         verticalAlignment = Alignment.CenterVertically,
@@ -1103,6 +1132,13 @@ private fun EpicGameDetailScreen(
                     )
                 }
             }
+
+            else -> MediaTab(
+                media = media,
+                loading = mediaLoading,
+                storeLabel = "Epic Games Store",
+                onOpenVideo = { MediaPlayback.openVideo(context, it) },
+            )
         }
         Spacer(Modifier.height(16.dp))
     }
