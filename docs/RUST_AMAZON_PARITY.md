@@ -152,3 +152,28 @@ gates, so the registry and notification are updated at the same rhythm as today.
   of inside each worker; same result, earlier.
 
 Everything else in §4 is 1:1.
+
+## 10. Improvements round 1 (2026-09-07, user go: "raise the ceilings")
+
+Device evidence that motivated it: Dread Templar 4.2 GB — Rust 71.5 s (avg 470 Mbps, peak
+579) vs Java 68.4 s, both 8 wide on the one a2z host (parity cap).
+
+- **Ceiling from the Steam speed tier (Rust path only).** `AmazonDownloadManager.downloadAllRust`
+  now passes `maxWorkers = DownloadSpeedConfig(DEFAULT_TIER).maxNetworkWindow.coerceIn(1,128)`
+  = **32** (Fast tier) and `processWorkers = max(cores/2, cfg.maxDecompress.coerceIn(1,32))`
+  into `BlAmazonDownload.runBlocking`. The Java fallback loop keeps `MAX_PARALLEL = 8` and
+  every other count untouched.
+- **Whole ceiling on the single host.** `amazon::per_host_cap_for(max_workers, distinct_hosts)`
+  = `max(6, ceil(32 / 1))` = **32**, so the core's `hosts × per_host_cap` clamp no longer cuts
+  the window; stream mode stays (no byte-budget serialisation, memory = unwritten pieces).
+- **Duplicate log lines fixed.** Each engine line (`engine=rust …`, `fetch-start …`,
+  `fetch-window …`, `summary …`) appeared twice in logcat: the native facade wrote it via
+  `__android_log_write` AND forwarded it to the listener, where the Java manager wrote it
+  again via `Log.i`. The native write is gone; the Java side is the single logcat + debug-file
+  writer.
+- Every §4 rule is unchanged (skip/resume, hash, `.tmp` layout, cancel, progress gates and
+  strings, post-install). The core was not edited.
+
+New log grammar on the `engine=rust` line:
+`engine=rust mode=stream plan=<n> files skip=<k> (<bytes>) fetch=<m> (<bytes>) hosts=1 workers=32 per_host_cap=32 process=<p> dir=…`
+followed by the core's `fetch-start label=amazon … ceiling=32 … per_host_cap=32 … mode=stream`.

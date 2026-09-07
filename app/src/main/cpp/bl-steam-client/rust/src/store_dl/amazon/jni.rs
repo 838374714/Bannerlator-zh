@@ -12,42 +12,17 @@ use crate::store_dl::amazon::{run_download, MAX_PARALLEL};
 use jni::objects::{GlobalRef, JClass, JObject, JString, JValue};
 use jni::sys::{jint, jlong, JNI_FALSE, JNI_TRUE};
 use jni::{JNIEnv, JavaVM};
-#[cfg(target_os = "android")]
-use std::ffi::CString;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, OnceLock};
 use std::thread;
 
-/// Logcat tag; the first line of every run is `engine=rust …`.
+/// Logcat tag (`adb logcat -s BL_AMAZON_DL`). Every engine line reaches logcat exactly ONCE:
+/// this module only forwards lines to the listener (`onLog`), and the Java manager is the one
+/// place that writes them to `android.util.Log` + its debug file. (Round 1 fix: the native side
+/// used to also call `__android_log_write`, so each line appeared twice.)
 pub const LOG_TAG: &str = "BL_AMAZON_DL";
 
-#[cfg(target_os = "android")]
-#[link(name = "log")]
-unsafe extern "C" {
-    fn __android_log_write(prio: i32, tag: *const i8, text: *const i8) -> i32;
-}
-
 static JVM: OnceLock<JavaVM> = OnceLock::new();
-
-fn android_log(message: &str) {
-    #[cfg(target_os = "android")]
-    {
-        let Ok(tag) = CString::new(LOG_TAG) else {
-            return;
-        };
-        let sanitized = message.replace('\0', " ");
-        let Ok(text) = CString::new(sanitized) else {
-            return;
-        };
-        unsafe {
-            let _ = __android_log_write(4, tag.as_ptr().cast(), text.as_ptr().cast());
-        }
-    }
-    #[cfg(not(target_os = "android"))]
-    {
-        let _ = message;
-    }
-}
 
 fn clear_pending_exception(env: &mut JNIEnv) {
     if env.exception_check().unwrap_or(false) {
@@ -198,7 +173,6 @@ pub extern "system" fn Java_com_winlator_star_store_blsteam_BlAmazonDownload_nat
     thread::spawn(move || {
         let log_listener = listener.clone();
         let log = move |line: &str| {
-            android_log(line);
             with_attached_env(&log_listener, |env, obj| call_log(env, obj, line));
         };
         let progress_listener = listener.clone();
