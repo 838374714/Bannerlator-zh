@@ -140,7 +140,7 @@ own pool — nothing has been fetched at that point, so this fallback cannot cha
 | delta / resume: size + full-file SHA-1 (all-zero = unverifiable), cancel during verify, progress every 64 files, nothing-to-do exit | `:315-352`, `:1423-1440` | Java (before the switch) |
 | needed chunks = first-seen order over pending files' parts | `:354`, `:1400-1415` | 1:1 — `plan.rs::unique_chunks_for_files`, cross-checked by count |
 | `totalBytes = Σ max(fileSize, 1)` | `:358` | 1:1 — `plan.rs::total_credit_bytes`, cross-checked by value |
-| concurrency = fixed 8 | `:408` | 1:1 ceiling — `max_workers = 8`, `per_host_cap = 8` (one CDN may carry all 8 like the Java threads do); the core's adaptive window never exceeds 8 |
+| concurrency = fixed 8 | `:408` | was 1:1 in the parity build; since improvements round 1 (§6) the native path uses the speed-tier ceiling (32) split across the CDNs — the Java fallback pool keeps its fixed 8 |
 | chunk skip when `.chunks/<GUID>` exists (any size), still credited to progress | `:414-415`, `:422-423` | 1:1 — `driver.rs` cached-skip pass, same credit, one progress callback per skipped chunk |
 | chunk URL `prefix/chunkDir/%02d/%016X_GUID.chunk`, DECIMAL group | `:98-100`, `:1177` | 1:1 — `ChunkInfo::path` + `plan.rs::chunk_url` (tests) |
 | no auth on chunk URLs, UA header | `:1177`, `:1183` | 1:1 — `FetchOptions.headers = [User-Agent]` |
@@ -182,3 +182,30 @@ engine not started (…), using Java chunk pool`. The same lines appear prefixed
 Java-vs-Rust A/B: same title, same `installTags`, compare `bh_epic_debug.txt` line sets — with
 the engine on, the only extra lines are the `[rust] …` ones; every Java line (`delta:`,
 `totalDownloadBytes=`, `chunksOK=`, `assembling`, `INSTALL COMPLETE`) is identical.
+
+## 6. Improvements round 1 (2026-09-07, user go after the device-proven parity build)
+
+Device evidence: Alone With You ran 12.4 s @ 24 MB/s on Rust vs 11.4 s @ 27.6 MB/s on Java —
+both capped by the parity ceiling of 8. Change (Rust path only, `runRustChunkPool` in
+`EpicDownloadManager.java`):
+
+| knob | parity build | round 1 | where |
+|---|---|---|---|
+| window ceiling (`max_workers`) | 8 (Java pool width) | `DownloadSpeedConfig(DEFAULT_TIER).maxNetworkWindow` clamped 1..128 = **32** (Fast tier) | Java helper → JNI `maxWorkers` |
+| `per_host_cap` | 8 (one CDN could carry all 8) | `max(6, ceil(32 / distinct CDNs))` = **11** with Epic's usual 3 CDNs, 16 with 2, 32 with 1 | `plan.rs::per_host_cap`, computed in the adapter, logged |
+| `process_workers` | 2 | `max(2, cfg.maxDecompress clamped 1..32)` = cores × 0.5 (e.g. **4** on an 8-core SoC) | Java helper → JNI `processWorkers` |
+| mode | whole-body | whole-body (chunks ≤ ~1 MiB compressed; the core's in-flight byte budget scales with the window) | — |
+
+Everything else in §4 is unchanged: skip/resume, chunk verification, `.chunks` layout, cancel
+poll/drain, progress strings and cadence, plan cross-check, fallback, post-install. The Java
+fallback pool is byte-identical and still runs 8 threads.
+
+Log grammar (logcat `BL_EPIC_DL`, mirrored as `[rust] …` in `bh_epic_debug.txt`):
+`engine=rust label="epic app=<dir>" install_dir=… cdns=<n> hosts=<distinct> pending_files=<n>
+workers=32 per_host_cap=<cap> process_workers=<n> manifest_bytes=<n>` → `plan chunk_dir=…
+chunks=N bytes=B hosts=H workers=32 per_host_cap=<cap> process_workers=<n>` → `skip cached=…
+to_fetch=…` → core `fetch-window label=… window=… (min=… max=…) in_flight=… budget_stalls=…
+host_stalls=…` → `summary bytes= decompressed= skipped_chunks= elapsed= avg_mbps= peak_mbps=
+avg_MBps=` → `chunksOK=N`. The `max=` on the `fetch-window` line should now read 32 (3 CDNs ×
+11 = 33, clamped to the ceiling); `host_stalls` replacing `budget_stalls` as the binding
+constraint is expected and not a regression.

@@ -240,11 +240,13 @@ pub extern "system" fn Java_com_winlator_star_store_blsteam_BlEpicDownload_nativ
         format!("epic app={base}")
     };
 
+    let host_count = super::plan::distinct_prefixes(&cdn_prefixes).len();
+    let host_cap = super::plan::per_host_cap(max_workers, host_count);
     log_both(
         &mut env,
         &listener,
         &format!(
-            "engine=rust label=\"{label}\" install_dir={install_dir} cdns={} pending_files={} workers={max_workers} process_workers={process_workers} manifest_bytes={}",
+            "engine=rust label=\"{label}\" install_dir={install_dir} cdns={} hosts={host_count} pending_files={} workers={max_workers} per_host_cap={host_cap} process_workers={process_workers} manifest_bytes={}",
             cdn_prefixes.len(),
             pending_file_indices.len(),
             manifest_bytes.len()
