@@ -370,50 +370,20 @@ public class EpicDownloadManager {
             dbg.append("totalDownloadBytes=").append(totalBytes)
                .append(String.format(" (%.1f MB)\n", totalBytes / 1048576.0));
 
-            // Download unique chunks — 8 parallel threads
-            ExecutorService pool = Executors.newFixedThreadPool(8);
-            for (ChunkInfo chunk : neededChunks) {
-                final ChunkInfo fc = chunk;
-                pool.submit(() -> {
-                    // Cancel: don't start new chunk work once the user has cancelled.
-                    if (cancelFlag != null && cancelFlag.get()) return;
-                    File cachedFile = new File(chunkCacheDir, fc.guidStr());
-                    if (!cachedFile.exists()) {
-                        if (!downloadChunkStreaming(fc, manifest.chunkDir, cdnUrls, cachedFile)) {
-                            Log.e(TAG, "Chunk download failed: " + fc.guidStr());
-                            chunkLog.add("FAIL chunk=" + fc.guidStr());
-                            failCount.incrementAndGet();
-                            return;
-                        }
-                    }
-                    long done = completedBytes.addAndGet(Math.max(fc.fileSize, 1));
-                    int  cnt  = completedCount.incrementAndGet();
-                    int  pct  = (int)(done * 80L / fTotalBytes);
-
-                    long nowMs     = System.currentTimeMillis();
-                    long prevMs    = lastSpeedMs.get();
-                    long timeDelta = nowMs - prevMs;
-                    if (timeDelta >= 500 && lastSpeedMs.compareAndSet(prevMs, nowMs)) {
-                        long prevB  = lastSpeedBytes.getAndSet(done);
-                        long bDelta = done - prevB;
-                        if (timeDelta > 0) currentSpeedBps.set(bDelta * 1000L / timeDelta);
-                    }
-
-                    String mb    = String.format("%.1f / %.1f MB", done / 1048576.0, fTotalBytes / 1048576.0);
-                    String speed = formatSpeed(currentSpeedBps.get());
-                    progress(progressCallback,
-                            "Downloading chunks (" + cnt + "/" + totalChunks + ")  " + mb
-                            + (speed.isEmpty() ? "" : "  " + speed), pct);
-                });
-            }
-            pool.shutdown();
-            try {
-                // Poll instead of a single infinite await so a cancel is honored within ~250ms:
-                // in-flight chunks are interrupted, queued ones never start (closure guard above).
-                while (!pool.awaitTermination(250, TimeUnit.MILLISECONDS)) {
-                    if (cancelFlag != null && cancelFlag.get()) {
-                        pool.shutdownNow();
-                        pool.awaitTermination(5, TimeUnit.SECONDS);
+            // Engine switch (docs/RUST_EPIC_PARITY.md): the native fetch core replaces ONLY the
+            // pool below — same inputs (needed chunks, CDN list, cache dir), same outputs
+            // (`.chunks/<GUID>` verified cache files), same progress / cancel / failure handling
+            // and the same debug lines. The Java pool is byte-identical and runs when the flag is
+            // OFF or the engine could not start (library missing, plan cross-check failed) —
+            // nothing has been fetched in that case, so falling through is safe.
+            boolean useJavaPool = true;
+            if (com.winlator.star.store.blsteam.BlStoreEngineFlag.isEpicEnabled(ctx)) {
+                RustPoolResult rr = runRustChunkPool(ctx, dbg, manifestBytes, manifest, pendingFiles,
+                        neededChunks, fTotalBytes, installDirPath, cdnUrls, cancelFlag, progressCallback,
+                        completedBytes, completedCount, lastSpeedMs, lastSpeedBytes, currentSpeedBps);
+                if (rr.started) {
+                    useJavaPool = false;
+                    if (rr.cancelled) {
                         dbg.append("CANCELLED during chunk download ")
                            .append("(").append(completedCount.get()).append("/").append(totalChunks)
                            .append(" chunks)\n");
@@ -421,13 +391,78 @@ public class EpicDownloadManager {
                         Log.i(TAG, "Epic install cancelled during chunk download");
                         return false;
                     }
+                    if (!rr.success) {
+                        // Surfaces through the shared "N chunks failed" exit below, like a Java
+                        // chunk that exhausted every CDN.
+                        chunkLog.add("FAIL engine=rust " + rr.error);
+                        failCount.incrementAndGet();
+                    }
+                } else {
+                    dbg.append("rust engine not started (").append(rr.error)
+                       .append(") -> Java chunk pool\n");
+                    Log.w(TAG, "Rust Epic engine not started (" + rr.error + "), using Java chunk pool");
                 }
-            } catch (InterruptedException e) {
-                Thread.currentThread().interrupt();
-                pool.shutdownNow();
-                dbg.append("ERROR: chunk pool interrupted\n");
-                writeDebug(ctx, dbg);
-                return false;
+            }
+            if (useJavaPool) {
+                // Download unique chunks — 8 parallel threads
+                ExecutorService pool = Executors.newFixedThreadPool(8);
+                for (ChunkInfo chunk : neededChunks) {
+                    final ChunkInfo fc = chunk;
+                    pool.submit(() -> {
+                        // Cancel: don't start new chunk work once the user has cancelled.
+                        if (cancelFlag != null && cancelFlag.get()) return;
+                        File cachedFile = new File(chunkCacheDir, fc.guidStr());
+                        if (!cachedFile.exists()) {
+                            if (!downloadChunkStreaming(fc, manifest.chunkDir, cdnUrls, cachedFile)) {
+                                Log.e(TAG, "Chunk download failed: " + fc.guidStr());
+                                chunkLog.add("FAIL chunk=" + fc.guidStr());
+                                failCount.incrementAndGet();
+                                return;
+                            }
+                        }
+                        long done = completedBytes.addAndGet(Math.max(fc.fileSize, 1));
+                        int  cnt  = completedCount.incrementAndGet();
+                        int  pct  = (int)(done * 80L / fTotalBytes);
+
+                        long nowMs     = System.currentTimeMillis();
+                        long prevMs    = lastSpeedMs.get();
+                        long timeDelta = nowMs - prevMs;
+                        if (timeDelta >= 500 && lastSpeedMs.compareAndSet(prevMs, nowMs)) {
+                            long prevB  = lastSpeedBytes.getAndSet(done);
+                            long bDelta = done - prevB;
+                            if (timeDelta > 0) currentSpeedBps.set(bDelta * 1000L / timeDelta);
+                        }
+
+                        String mb    = String.format("%.1f / %.1f MB", done / 1048576.0, fTotalBytes / 1048576.0);
+                        String speed = formatSpeed(currentSpeedBps.get());
+                        progress(progressCallback,
+                                "Downloading chunks (" + cnt + "/" + totalChunks + ")  " + mb
+                                + (speed.isEmpty() ? "" : "  " + speed), pct);
+                    });
+                }
+                pool.shutdown();
+                try {
+                    // Poll instead of a single infinite await so a cancel is honored within ~250ms:
+                    // in-flight chunks are interrupted, queued ones never start (closure guard above).
+                    while (!pool.awaitTermination(250, TimeUnit.MILLISECONDS)) {
+                        if (cancelFlag != null && cancelFlag.get()) {
+                            pool.shutdownNow();
+                            pool.awaitTermination(5, TimeUnit.SECONDS);
+                            dbg.append("CANCELLED during chunk download ")
+                               .append("(").append(completedCount.get()).append("/").append(totalChunks)
+                               .append(" chunks)\n");
+                            writeDebug(ctx, dbg);
+                            Log.i(TAG, "Epic install cancelled during chunk download");
+                            return false;
+                        }
+                    }
+                } catch (InterruptedException e) {
+                    Thread.currentThread().interrupt();
+                    pool.shutdownNow();
+                    dbg.append("ERROR: chunk pool interrupted\n");
+                    writeDebug(ctx, dbg);
+                    return false;
+                }
             }
 
             // Cancel could also have landed on the last poll boundary, after the pool drained.
@@ -502,6 +537,125 @@ public class EpicDownloadManager {
             Log.e(TAG, "Epic install failed", e);
             return false;
         }
+    }
+
+    // ── Rust fetch core (engine switch) ───────────────────────────────────────
+
+    /** Outcome of the native chunk pool; {@code started == false} → the Java pool must run. */
+    private static final class RustPoolResult {
+        boolean started;
+        boolean success;
+        boolean cancelled;
+        String  error = "";
+    }
+
+    /**
+     * Run the native chunk pool for {@code pendingFiles}: the engine re-parses the SAME manifest
+     * bytes, rebuilds the SAME needed-chunk list (cross-checked against Java's count + byte total
+     * before any fetch), skips chunks already in the cache, and writes verified chunks with the
+     * same {@code .part} + rename protocol into the same {@code .chunks/<GUID>} names — so the
+     * assembly loop and every resume path below see exactly what the Java pool would have left.
+     * Progress mirrors the pool task's message / pct / speed logic on the SAME counters so the UI
+     * and registry ticks are indistinguishable. Never throws.
+     */
+    private static RustPoolResult runRustChunkPool(
+            android.content.Context ctx,
+            StringBuilder dbg,
+            byte[] manifestBytes,
+            EpicManifest.ParsedManifest manifest,
+            List<FileInfo> pendingFiles,
+            List<ChunkInfo> neededChunks,
+            long totalBytes,
+            String installDirPath,
+            List<CdnUrl> cdnUrls,
+            AtomicBoolean cancelFlag,
+            ProgressCallback progressCallback,
+            AtomicLong completedBytes,
+            AtomicInteger completedCount,
+            AtomicLong lastSpeedMs,
+            AtomicLong lastSpeedBytes,
+            AtomicLong currentSpeedBps) {
+        RustPoolResult r = new RustPoolResult();
+        try {
+            // pendingFiles are FileInfo objects out of manifest.files (identity, no equals()).
+            java.util.IdentityHashMap<FileInfo, Integer> index = new java.util.IdentityHashMap<>();
+            for (int i = 0; i < manifest.files.size(); i++) index.put(manifest.files.get(i), i);
+            int[] pendingIdx = new int[pendingFiles.size()];
+            for (int i = 0; i < pendingFiles.size(); i++) {
+                Integer k = index.get(pendingFiles.get(i));
+                if (k == null) { r.error = "pending file not in manifest"; return r; }
+                pendingIdx[i] = k;
+            }
+            String[] prefixes = new String[cdnUrls.size()];
+            for (int i = 0; i < cdnUrls.size(); i++)
+                prefixes[i] = cdnUrls.get(i).baseUrl + cdnUrls.get(i).cloudDir;
+            String caPath = com.winlator.star.store.blsteam.CaBundleExtractor.INSTANCE.ensureBundle(ctx);
+
+            final int  totalChunks = neededChunks.size();
+            final long fTotalBytes = totalBytes;
+            // Improvements round 1: the native path takes its ceilings from the Steam speed tier
+            // (Fast = window 32, decompress = cores/2) instead of the Java pool's fixed 8; the
+            // adapter splits the window across the distinct CDNs (per_host_cap). The Java
+            // fallback pool below keeps its own fixed counts.
+            DownloadSpeedConfig cfg = new DownloadSpeedConfig(DownloadSpeedConfig.DEFAULT_TIER);
+            final int rustWorkers = Math.max(1, Math.min(128, cfg.getMaxNetworkWindow()));
+            final int rustProcess = Math.max(2, Math.max(1, Math.min(32, cfg.getMaxDecompress())));
+            com.winlator.star.store.blsteam.BlEpicDownload.Result res =
+                    com.winlator.star.store.blsteam.BlEpicDownload.run(
+                            manifestBytes, installDirPath, prefixes, pendingIdx, totalChunks, totalBytes,
+                            caPath, rustWorkers, rustProcess, cancelFlag,
+                            new com.winlator.star.store.blsteam.BlEpicDownload.Listener() {
+                @Override public void onPlan(int chunksTotal, long bytesTotal, String chunkDir) {
+                    synchronized (dbg) {
+                        dbg.append("[rust] plan chunks=").append(chunksTotal)
+                           .append(" bytes=").append(bytesTotal)
+                           .append(" chunkDir=").append(chunkDir).append("\n");
+                    }
+                }
+
+                @Override public void onProgress(long bytesDone, long bytesTotal, int chunksDone, int chunksTotal) {
+                    // Mirrors the pool task above: same counters, same pct, same 500 ms speed sample,
+                    // same message.
+                    completedBytes.set(bytesDone);
+                    completedCount.set(chunksDone);
+                    long done = bytesDone;
+                    int  cnt  = chunksDone;
+                    int  pct  = (int)(done * 80L / fTotalBytes);
+
+                    long nowMs     = System.currentTimeMillis();
+                    long prevMs    = lastSpeedMs.get();
+                    long timeDelta = nowMs - prevMs;
+                    if (timeDelta >= 500 && lastSpeedMs.compareAndSet(prevMs, nowMs)) {
+                        long prevB  = lastSpeedBytes.getAndSet(done);
+                        long bDelta = done - prevB;
+                        if (timeDelta > 0) currentSpeedBps.set(bDelta * 1000L / timeDelta);
+                    }
+
+                    String mb    = String.format("%.1f / %.1f MB", done / 1048576.0, fTotalBytes / 1048576.0);
+                    String speed = formatSpeed(currentSpeedBps.get());
+                    progress(progressCallback,
+                            "Downloading chunks (" + cnt + "/" + totalChunks + ")  " + mb
+                            + (speed.isEmpty() ? "" : "  " + speed), pct);
+                }
+
+                @Override public void onLog(String line) {
+                    synchronized (dbg) { dbg.append("[rust] ").append(line).append("\n"); }
+                }
+
+                @Override public void onComplete(boolean success, String error, long bytesCredited) {
+                    // Terminal state is read from the facade's Result; nothing to do here.
+                }
+            });
+            r.started   = res.started;
+            r.success   = res.success;
+            r.cancelled = res.cancelled;
+            r.error     = res.error == null ? "" : res.error;
+        } catch (Throwable t) {
+            // Any facade / link failure → Java pool.
+            r.started = false;
+            r.error   = t.getClass().getSimpleName() + ": " + t.getMessage();
+        }
+        return r;
     }
 
     private static void writeDebug(android.content.Context ctx, StringBuilder dbg) {
