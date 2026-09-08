@@ -1,23 +1,10 @@
+```yaml
 name: _build (reusable matrix build)
 
-# MATRIX build (drafted 2026-07-12): each flavor (standard/ludashi/pubg) builds in
-# its OWN parallel job. Because each runner now packages exactly ONE ~588MB APK, the
-# OOM that forced `--no-parallel --max-workers=1` in the old single-job build is gone
-# — each job uses full workers. Wall-clock ≈ one flavor's build (~5-7min) instead of
-# ~11m41s for three sequential. Build minutes rise (3× setup/checkout) but the repo is
-# public so minutes are free → optimise purely for turnaround.
-#
-# Caching (unchanged from the single-job version, shared across the 3 matrix jobs):
-#   - JDK: setup-java preinstalled toolchain
-#   - Gradle deps + build cache via gradle/actions/setup-gradle (build cache now
-#     actually active via org.gradle.caching=true in gradle.properties)
-#   - NDK+cmake cached (key ndk-...); JavaSteam JARs cached (key = upstream commit);
-#     LSFG .so cached (key = source hash)
-#   All three cache keys are SHARED across the matrix. First run after a key change:
-#   the 3 jobs miss concurrently and each rebuilds in parallel (fine — free minutes;
-#   actions/cache dedupes the save, first writer wins, others log a harmless skip).
-#   Every cache is guarded so a MISS still does the real work; keys self-invalidate on
-#   their real input, so each build stays identical to a from-scratch build.
+# MATRIX build:
+# Each flavor (standard/ludashi/pubg) builds in its OWN parallel job.
+# One runner handles exactly one APK, which avoids the old single-job
+# memory pressure while still keeping the three flavors independent.
 
 on:
   workflow_call:
@@ -27,9 +14,8 @@ on:
         required: true
         type: string
     secrets:
-      # Samsung Galaxy Performance SDK jar (base64), optional. Supplied only by callers that
-      # opt in (test builds). When absent the build proceeds without it and the Galaxy
-      # Performance feature stays dormant. The proprietary jar is NEVER committed to the repo.
+      # Samsung Galaxy Performance SDK jar (base64), optional.
+      # The proprietary jar is never committed to the repository.
       GALAXY_PERF_SDK_JAR_B64:
         required: false
 
@@ -45,32 +31,45 @@ jobs:
     runs-on: ubuntu-22.04
 
     strategy:
-      fail-fast: false          # one flavor failing must NOT cancel the others
+      fail-fast: false
       matrix:
         flavor:
           - { id: standard, task: assembleStandardRelease }
-          - { id: ludashi,  task: assembleLudashiRelease  }
-          - { id: pubg,     task: assemblePubgRelease     }
+          - { id: ludashi,  task: assembleLudashiRelease }
+          - { id: pubg,     task: assemblePubgRelease }
 
     name: build (${{ matrix.flavor.id }})
 
     steps:
+
+    # ------------------------------------------------------------
+    # Checkout
+    # ------------------------------------------------------------
     - name: Clone repository
       uses: actions/checkout@v4
       with:
         submodules: recursive
-        fetch-depth: 1          # was 20 — the version step only needs HEAD
+        fetch-depth: 1
 
-    - name: Set up JDK 17 (preinstalled toolchain, no apt)
+    # ------------------------------------------------------------
+    # Java
+    # ------------------------------------------------------------
+    - name: Set up JDK 17
       uses: actions/setup-java@v4
       with:
         distribution: temurin
         java-version: '17'
 
-    - name: Set up Gradle (dependency + build cache)
+    # ------------------------------------------------------------
+    # Gradle cache
+    # ------------------------------------------------------------
+    - name: Set up Gradle
       uses: gradle/actions/setup-gradle@v4
 
-    - name: Resolve JavaSteam upstream commit (for cache key)
+    # ------------------------------------------------------------
+    # JavaSteam
+    # ------------------------------------------------------------
+    - name: Resolve JavaSteam upstream commit
       id: jsref
       run: |
         SHA=$(git ls-remote https://github.com/joshuatam/JavaSteam gamenative-latest 2>/dev/null | head -1 | cut -f1)
@@ -117,6 +116,7 @@ jobs:
             break
           fi
         done
+
         if [ -z "$MAIN_JAR" ]; then
           MAIN_JAR=$(find . -name "*.jar" -path "*/build/libs/*" \
             | grep -v "sources\|javadoc\|test" \
@@ -132,39 +132,71 @@ jobs:
 
         PROTO_JAR=$(find ~/.gradle/caches -name "protobuf-java-*.jar" \
           ! -name "*sources*" ! -name "*javadoc*" 2>/dev/null | head -1)
+
         [ -n "$PROTO_JAR" ] && cp "$PROTO_JAR" ../app/libs/steam/protobuf-java.jar
 
         LANG3_JAR=$(find ~/.gradle/caches -name "commons-lang3-*.jar" \
           ! -name "*sources*" ! -name "*javadoc*" 2>/dev/null | sort -V | tail -1)
+
         if [ -n "$LANG3_JAR" ]; then
           cp "$LANG3_JAR" ../app/libs/steam/commons-lang3.jar
         else
-          wget -q "https://repo1.maven.org/maven2/org/apache/commons/commons-lang3/3.14.0/commons-lang3-3.14.0.jar" \
+          wget -q \
+            "https://repo1.maven.org/maven2/org/apache/commons/commons-lang3/3.14.0/commons-lang3-3.14.0.jar" \
             -O ../app/libs/steam/commons-lang3.jar
         fi
 
         if [ -n "$DD_JAR" ] && [ -s "$DD_JAR" ]; then
           cp "$DD_JAR" ../app/libs/steam/javasteam-depotdownloader.jar
+
           GRADLE_CACHE=~/.gradle/caches/modules-2/files-2.1
+
           gather_jar() {
-            local pattern="$1" dest="$2"
+            local pattern="$1"
+            local dest="$2"
             local found
+
             found=$(find "$GRADLE_CACHE" -name "$pattern" \
-              ! -name "*sources*" ! -name "*javadoc*" 2>/dev/null | sort -V | tail -1)
+              ! -name "*sources*" ! -name "*javadoc*" 2>/dev/null \
+              | sort -V | tail -1)
+
             [ -n "$found" ] && cp "$found" "$dest"
           }
-          gather_jar "ktor-client-cio-jvm-*.jar"            "../app/libs/steam/ktor-client-cio.jar"
-          gather_jar "ktor-client-core-jvm-*.jar"           "../app/libs/steam/ktor-client-core.jar"
-          gather_jar "ktor-io-jvm-*.jar"                    "../app/libs/steam/ktor-io.jar"
-          gather_jar "ktor-http-jvm-*.jar"                  "../app/libs/steam/ktor-http.jar"
-          gather_jar "ktor-utils-jvm-*.jar"                 "../app/libs/steam/ktor-utils.jar"
-          gather_jar "ktor-network-jvm-*.jar"               "../app/libs/steam/ktor-network.jar"
-          gather_jar "ktor-network-tls-jvm-*.jar"           "../app/libs/steam/ktor-network-tls.jar"
-          gather_jar "kotlinx-serialization-json-jvm-*.jar" "../app/libs/steam/kotlinx-serialization-json.jar"
-          gather_jar "kotlinx-serialization-core-jvm-*.jar" "../app/libs/steam/kotlinx-serialization-core.jar"
-          gather_jar "kotlinx-io-core-jvm-*.jar"            "../app/libs/steam/kotlinx-io-core.jar"
+
+          gather_jar "ktor-client-cio-jvm-*.jar" \
+            "../app/libs/steam/ktor-client-cio.jar"
+
+          gather_jar "ktor-client-core-jvm-*.jar" \
+            "../app/libs/steam/ktor-client-core.jar"
+
+          gather_jar "ktor-io-jvm-*.jar" \
+            "../app/libs/steam/ktor-io.jar"
+
+          gather_jar "ktor-http-jvm-*.jar" \
+            "../app/libs/steam/ktor-http.jar"
+
+          gather_jar "ktor-utils-jvm-*.jar" \
+            "../app/libs/steam/ktor-utils.jar"
+
+          gather_jar "ktor-network-jvm-*.jar" \
+            "../app/libs/steam/ktor-network.jar"
+
+          gather_jar "ktor-network-tls-jvm-*.jar" \
+            "../app/libs/steam/ktor-network-tls.jar"
+
+          gather_jar "kotlinx-serialization-json-jvm-*.jar" \
+            "../app/libs/steam/kotlinx-serialization-json.jar"
+
+          gather_jar "kotlinx-serialization-core-jvm-*.jar" \
+            "../app/libs/steam/kotlinx-serialization-core.jar"
+
+          gather_jar "kotlinx-io-core-jvm-*.jar" \
+            "../app/libs/steam/kotlinx-io-core.jar"
         fi
 
+    # ------------------------------------------------------------
+    # Android NDK + CMake
+    # ------------------------------------------------------------
     - name: Cache NDK + cmake
       id: cache-ndk
       uses: actions/cache@v4
@@ -174,42 +206,60 @@ jobs:
           ${{ env.ANDROID_SDK_ROOT }}/cmake/3.22.1
         key: ndk-26.1.10909125-cmake-3.22.1
 
-    - name: Install NDK (only if not cached) + export ANDROID_NDK_HOME
+    - name: Install NDK if not cached + export ANDROID_NDK_HOME
       run: |
         SDK_ROOT="${ANDROID_SDK_ROOT}"
+
         mkdir -p "$SDK_ROOT"
+
         if [ ! -f "$SDK_ROOT/ndk/26.1.10909125/source.properties" ]; then
+
           if [ ! -f "$SDK_ROOT/cmdline-tools/latest/bin/sdkmanager" ]; then
-            curl -sL "https://dl.google.com/android/repository/commandlinetools-linux-11076708_latest.zip" -o /tmp/cmdline-tools.zip
+            curl -sL \
+              "https://dl.google.com/android/repository/commandlinetools-linux-11076708_latest.zip" \
+              -o /tmp/cmdline-tools.zip
+
             unzip -q /tmp/cmdline-tools.zip -d /tmp/cmdline-tools/
+
             mkdir -p "$SDK_ROOT/cmdline-tools"
-            mv /tmp/cmdline-tools/cmdline-tools "$SDK_ROOT/cmdline-tools/latest" 2>/dev/null || true
+
+            mv /tmp/cmdline-tools/cmdline-tools \
+              "$SDK_ROOT/cmdline-tools/latest" 2>/dev/null || true
+
             rm -f /tmp/cmdline-tools.zip
           fi
-          yes | "$SDK_ROOT/cmdline-tools/latest/bin/sdkmanager" --install "ndk;26.1.10909125" "cmake;3.22.1"
+
+          yes | "$SDK_ROOT/cmdline-tools/latest/bin/sdkmanager" \
+            --install "ndk;26.1.10909125" "cmake;3.22.1"
+
         else
           echo "NDK already present (cache hit) — skipping sdkmanager install"
         fi
-        echo "ANDROID_NDK_HOME=$SDK_ROOT/ndk/26.1.10909125" >> $GITHUB_ENV
 
+        echo "ANDROID_NDK_HOME=$SDK_ROOT/ndk/26.1.10909125" >> "$GITHUB_ENV"
+
+    # ------------------------------------------------------------
+    # Build scripts
+    # ------------------------------------------------------------
     - name: Grant execute permission for gradlew
       run: chmod +x gradlew
 
     - name: Grant execute permission for build script
       run: chmod +x build-lsfg-android.sh
 
-    # The base rootfs is a 193 MB download on every build and was the single flakiest step in the
-    # pipeline (HTTP 504s, and a Connection reset that failed the standard flavor on 2026-07-28).
-    # Cache it so only the first build after a change fetches it; a cache hit means no external
-    # request at all. Keyed on the sha256 pinned in app/build.gradle, so publishing a new rootfs
-    # (new release tag + new hash) invalidates the cache automatically — nothing to remember.
-    # NOT committed to the repo: at 193 MB it exceeds GitHub's 100 MB per-file limit, and in LFS it
-    # would burn the bandwidth quota and bloat every clone forever.
+    # ------------------------------------------------------------
+    # Base imagefs
+    # ------------------------------------------------------------
     - name: Resolve pinned imagefs hash
       id: imagefs-pin
       run: |
         SHA=$(grep -oP 'imageFSSha256\s*=\s*"\K[0-9a-f]{64}' app/build.gradle)
-        if [ -z "$SHA" ]; then echo "could not read imageFSSha256 from app/build.gradle" >&2; exit 1; fi
+
+        if [ -z "$SHA" ]; then
+          echo "could not read imageFSSha256 from app/build.gradle" >&2
+          exit 1
+        fi
+
         echo "sha=$SHA" >> "$GITHUB_OUTPUT"
 
     - name: Cache base imagefs
@@ -218,6 +268,9 @@ jobs:
         path: app/src/main/assets/imagefs.tar.zst
         key: imagefs-${{ steps.imagefs-pin.outputs.sha }}
 
+    # ------------------------------------------------------------
+    # LSFG native library
+    # ------------------------------------------------------------
     - name: Cache LSFG native library
       id: cache-lsfg
       uses: actions/cache@v4
@@ -225,23 +278,22 @@ jobs:
         path: app/src/main/jniLibs/arm64-v8a/libVkLayer_LSFGVK_frame_generation.so
         key: lsfg-${{ hashFiles('app/src/main/cpp/lsfg-vk/**', 'build-lsfg-android.sh') }}
 
-    - name: Build LSFG native library (only if not cached)
+    - name: Build LSFG native library if not cached
       if: steps.cache-lsfg.outputs.cache-hit != 'true'
       run: ./build-lsfg-android.sh
 
-    # --- bl-steam-client: the native Rust Steam CM engine (libblsteam.so) --------------------
-    # Cross-compiled with cargo for aarch64-linux-android and dropped into jniLibs so it ships in
-    # every flavor exactly like the other prebuilt .so files. rustup/cargo are preinstalled on the
-    # runner image; only the Android target has to be added. The one C-compiling crate (`ring`,
-    # via rustls) needs the NDK clang/llvm-ar exported below — everything else is pure Rust.
-    # Cache = cargo registry + the crate's target/ dir, keyed on rustc version + Cargo.lock, so a
-    # source-only change rebuilds just this crate on top of the cached dependency objects.
-    - name: Rust toolchain (aarch64-linux-android target)
+    # ------------------------------------------------------------
+    # Rust Steam client
+    # ------------------------------------------------------------
+    - name: Rust toolchain
       id: rust
       run: |
         rustup target add aarch64-linux-android
+
         echo "rustc=$(rustc -V | awk '{print $2}')" >> "$GITHUB_OUTPUT"
-        rustc -V; cargo -V
+
+        rustc -V
+        cargo -V
 
     - name: Cache cargo registry + bl-steam-client target
       uses: actions/cache@v4
@@ -255,89 +307,106 @@ jobs:
         restore-keys: |
           blsteam-${{ steps.rust.outputs.rustc }}-
 
-    - name: Build libblsteam.so (cargo, aarch64-linux-android)
+    - name: Build libblsteam.so
       run: |
         NDK_BIN="$ANDROID_NDK_HOME/toolchains/llvm/prebuilt/linux-x86_64/bin"
-        test -x "$NDK_BIN/aarch64-linux-android26-clang" || { echo "NDK clang missing at $NDK_BIN" >&2; exit 1; }
+
+        test -x "$NDK_BIN/aarch64-linux-android26-clang" || {
+          echo "NDK clang missing at $NDK_BIN" >&2
+          exit 1
+        }
+
         export PATH="$NDK_BIN:$PATH"
         export CC_aarch64_linux_android="$NDK_BIN/aarch64-linux-android26-clang"
         export AR_aarch64_linux_android="$NDK_BIN/llvm-ar"
         export CARGO_TARGET_AARCH64_LINUX_ANDROID_LINKER="$NDK_BIN/aarch64-linux-android26-clang"
+
         cd app/src/main/cpp/bl-steam-client/rust
-        cargo build --locked --release --target aarch64-linux-android --lib
+
+        cargo build \
+          --locked \
+          --release \
+          --target aarch64-linux-android \
+          --lib
+
         SO=target/aarch64-linux-android/release/libblsteam.so
+
         test -s "$SO"
-        # Rebrand + packaging assertion: the JNI entry point Kotlin binds at boot must be exported,
-        # otherwise the boot probe (BlSteamClient.probe) fails silently on device.
+
+        # Verify required JNI entry point.
         "$NDK_BIN/llvm-nm" -D --defined-only "$SO" \
           | grep -q ' Java_com_winlator_star_store_blsteam_BlSteamClient_nativeVersion$' \
-          || { echo "libblsteam.so lacks the BlSteamClient_nativeVersion JNI export" >&2; exit 1; }
+          || {
+            echo "libblsteam.so lacks the BlSteamClient_nativeVersion JNI export" >&2
+            exit 1
+          }
+
         "$NDK_BIN/llvm-readelf" -d "$SO" | grep -i soname
+
         ls -la "$SO"
+
         mkdir -p ../../../jniLibs/arm64-v8a
-        cp "$SO" ../../../jniLibs/arm64-v8a/libblsteam.so
 
-    - name: bl-steam-client host unit tests (informational, non-blocking)
-      # The crate carries 224 #[test] functions that have never executed ANYWHERE. The build
-      # step above cross-compiles for the device, and `cargo build` excludes #[cfg(test)] code
-      # by design - so today those tests are neither run NOR compiled, and every one of them
-      # could be broken without turning this workflow red.
-      #
-      # They are pure host-side logic (wire encoding, protobuf field numbers, EMsg values), so
-      # they need no device, no NDK and no Steam session - hence a plain `cargo test` with no
-      # --target, which compiles and runs for the runner's own architecture.
-      #
-      # Deliberately non-blocking on this first run: the point is to LEARN whether they pass,
-      # and a failure must not cost us the APK. Note the crate has cfg(target_os = "android")
-      # blocks in jni.rs and depot_writer.rs, so a host build may not even compile - that
-      # outcome is itself the answer we are after. Make this blocking once it is known-green.
-      continue-on-error: true
-      run: |
-        cd app/src/main/cpp/bl-steam-client/rust
-        cargo test --locked
+        cp "$SO" \
+          ../../../jniLibs/arm64-v8a/libblsteam.so
 
-    - name: bl-steam-client dependency audit (cargo tree + licenses)
-      run: |
-        cd app/src/main/cpp/bl-steam-client/rust
-        echo "== crates linked into libblsteam.so (aarch64-linux-android; normal+build deps) =="
-        cargo tree --locked --target aarch64-linux-android -e normal,build --prefix none --format '{p} {l}' | sort -u
-        echo "== -sys crates =="
-        cargo tree --locked --target aarch64-linux-android -e normal,build --prefix none --format '{p}' | sort -u | grep -- '-sys' || echo "(none)"
-
-    - name: Restore Galaxy Performance SDK jar (optional, from secret)
-      # Decodes the proprietary Samsung jar from the encrypted secret into the git-ignored
-      # drop-point so app/build.gradle bundles it. No secret => no jar => feature dormant.
-      # The secret value is piped, never echoed, so it cannot leak into the log.
+    # ------------------------------------------------------------
+    # Galaxy Performance SDK
+    # ------------------------------------------------------------
+    - name: Restore Galaxy Performance SDK jar
       env:
         GALAXY_JAR_B64: ${{ secrets.GALAXY_PERF_SDK_JAR_B64 }}
       run: |
         if [ -n "$GALAXY_JAR_B64" ]; then
           mkdir -p app/libs/GalaxyPerf
-          printf '%s' "$GALAXY_JAR_B64" | base64 -d > app/libs/GalaxyPerf/perfsdk-v1.0.0.jar
+
+          printf '%s' "$GALAXY_JAR_B64" \
+            | base64 -d \
+            > app/libs/GalaxyPerf/perfsdk-v1.0.0.jar
+
           echo "Galaxy Performance SDK restored: $(wc -c < app/libs/GalaxyPerf/perfsdk-v1.0.0.jar) bytes"
         else
           echo "No Galaxy SDK secret set — building without it (Galaxy feature dormant)."
         fi
 
+    # ------------------------------------------------------------
+    # Android APK build
+    #
+    # IMPORTANT:
+    # One flavor per runner, but Gradle itself is deliberately limited
+    # to two workers to reduce peak RAM usage.
+    # ------------------------------------------------------------
     - name: Build with Gradle
-      # ONE flavor per job → only one ~588MB APK packages here, so the old
-      # `--no-parallel --max-workers=1` OOM-guard is dropped; full workers now.
-      # org.gradle.caching=true (gradle.properties) reuses task outputs across runs.
-      run: ./gradlew ${{ matrix.flavor.task }} -Dorg.gradle.jvmargs="-Xmx5g -XX:MaxMetaspaceSize=1g"
+      run: |
+        ./gradlew ${{ matrix.flavor.task }} \
+          --no-parallel \
+          --max-workers=2 \
+          -Dorg.gradle.jvmargs="-Xmx4g -XX:MaxMetaspaceSize=768m"
 
+    # ------------------------------------------------------------
+    # Version information
+    # ------------------------------------------------------------
     - name: Get version info
       run: |
-        echo "SHORT_SHA=$(git rev-parse --short HEAD)" >> $GITHUB_ENV
-        echo "VERSION=$(grep versionName app/build.gradle | head -1 | cut -d '"' -f 2)" >> $GITHUB_ENV
-        echo "BUILD_DATE=$(date +'%Y%m%d')" >> $GITHUB_ENV
+        echo "SHORT_SHA=$(git rev-parse --short HEAD)" >> "$GITHUB_ENV"
+        echo "VERSION=$(grep versionName app/build.gradle | head -1 | cut -d '"' -f 2)" >> "$GITHUB_ENV"
+        echo "BUILD_DATE=$(date +'%Y%m%d')" >> "$GITHUB_ENV"
 
+    # ------------------------------------------------------------
+    # Rename APK
+    # ------------------------------------------------------------
     - name: Rename APK
       run: |
         N="${{ inputs.release_number }}"
         F="${{ matrix.flavor.id }}"
-        mv app/build/outputs/apk/${F}/release/app-${F}-release.apk \
-           app/build/outputs/apk/${F}/release/Bannerlator-${N}-${F}.apk
 
+        mv \
+          "app/build/outputs/apk/${F}/release/app-${F}-release.apk" \
+          "app/build/outputs/apk/${F}/release/Bannerlator-${N}-${F}.apk"
+
+    # ------------------------------------------------------------
+    # Upload APK
+    # ------------------------------------------------------------
     - name: Upload ${{ matrix.flavor.id }} APK artifact
       uses: actions/upload-artifact@v4
       with:
@@ -345,3 +414,4 @@ jobs:
         path: app/build/outputs/apk/${{ matrix.flavor.id }}/release/Bannerlator-${{ inputs.release_number }}-${{ matrix.flavor.id }}.apk
         if-no-files-found: error
         retention-days: 7
+```
