@@ -233,7 +233,11 @@ class RemoteSourceRepository(private val context: Context) {
         val sourceName: String,
         val publishedAt: String? = null,  // "YYYY-MM-DD" from GitHub releases; null for WCP JSON sources
         val sizeBytes: Long? = null,      // asset size in bytes; null when not available
-        val description: String? = null   // release body/notes from GitHub; null for WCP JSON / Contents sources
+        val description: String? = null,  // release body/notes from GitHub; null for WCP JSON / Contents sources
+        // WCP JSON catalogs only: the row's verCode and, when the row carries one, the wcp profile's
+        // versionName (the layer line, e.g. "11.0-6-arm64ec") — [versionName] above is the display label.
+        val verCode: Int? = null,
+        val profileVersionName: String? = null,
     )
 
     /**

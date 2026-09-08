@@ -84,6 +84,11 @@ public class ContentsManager {
 
     private ArrayList<ContentProfile> remoteProfiles;
 
+    // Last successfully parsed catalog (process-lifetime). Lets a caller that only needs a
+    // best-effort look at the catalog (container layer-update scan) reuse whatever an earlier
+    // fetch already parsed instead of hitting the network again.
+    private static volatile ArrayList<ContentProfile> cachedRemoteProfiles;
+
     public ContentsManager(Context context) {
         this.context = context;
         this.preferences = context.getSharedPreferences("contents_manager_prefs", Context.MODE_PRIVATE);
@@ -112,15 +117,29 @@ public class ContentsManager {
                     remoteProfile.type = ContentProfile.ContentType.getTypeByName(object.getString("type"));
                     remoteProfile.verName = object.getString("verName");
                     remoteProfile.verCode = object.getInt("verCode");
+                    String versionName = object.optString("versionName", "");
+                    remoteProfile.versionName = versionName.isEmpty() ? null : versionName;
                     remoteProfiles.add(remoteProfile);
                 } catch (JSONException e) {
                     e.printStackTrace();
                 }
             }
+            cachedRemoteProfiles = new ArrayList<>(remoteProfiles);
         } catch (JSONException e) {
             e.printStackTrace();
         }
         syncContents();
+    }
+
+    /** Uses an already-parsed catalog (see {@link #getCachedRemoteProfiles()}) instead of JSON. */
+    public void setRemoteProfiles(List<ContentProfile> profiles) {
+        remoteProfiles = new ArrayList<>(profiles);
+        syncContents();
+    }
+
+    /** The catalog rows of the most recent {@link #setRemoteProfiles(String)} in this process, or null. */
+    public static List<ContentProfile> getCachedRemoteProfiles() {
+        return cachedRemoteProfiles;
     }
 
     public void syncContents() {
