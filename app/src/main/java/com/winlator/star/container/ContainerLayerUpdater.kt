@@ -150,6 +150,8 @@ class ContainerLayerUpdater(private val context: Context) {
         val oldWine = WineInfo.fromIdentifier(context, contentsManager, snapshot.oldEntry)
         val written = ContainerManager.refreshCommonDlls(oldDir, oldWine.isArm64EC, container.rootDir)
         FileUtils.delete(snapshot.dir)
+        // Drop the (now empty) backup root too so the container dir stays clean after a revert.
+        snapshot.dir.parentFile?.takeIf { it.name == BACKUP_DIR && (it.list()?.isEmpty() == true) }?.delete()
         val msg = "Reverted \"${container.name}\": $previous -> ${snapshot.oldEntry} ($written builtin files refreshed)"
         Log.i(TAG, msg)
         return Result.success(msg)
