@@ -123,7 +123,7 @@ public class VulkanRenderer implements WindowManager.OnWindowModificationListene
     private native void nativeSetToon(long handle, boolean enabled);
     private native void nativeSetCrt(long handle, boolean enabled);
     private native void nativeSetNtsc(long handle, boolean enabled);
-    private native void nativeSetColorGrade(long handle, float brightness, float contrast, float gamma);
+    private native void nativeSetColorGrade(long handle, float brightness, float contrast, float gamma, float saturation);
     private native void nativeSetSwapRB(long handle, boolean enabled);
     private native void nativeSetPresentMode(long handle, int mode);
     private native int[] nativeGetSupportedPresentModes(long handle);
@@ -178,7 +178,7 @@ public class VulkanRenderer implements WindowManager.OnWindowModificationListene
                     nativeSetToon(nativeHandle, pendingToonEnabled);
                     nativeSetCrt(nativeHandle, pendingCrtEnabled);
                     nativeSetNtsc(nativeHandle, pendingNtscEnabled);
-                    nativeSetColorGrade(nativeHandle, pendingColorBrightness, pendingColorContrast, pendingColorGamma);
+                    nativeSetColorGrade(nativeHandle, pendingColorBrightness, pendingColorContrast, pendingColorGamma, pendingColorSaturation);
                     nativeSetSwapRB(nativeHandle, pendingSwapRB);
                     if (pendingLsfgCachePath != null)
                         nativeSetLsfgCachePath(nativeHandle, pendingLsfgCachePath);
@@ -848,20 +848,22 @@ public class VulkanRenderer implements WindowManager.OnWindowModificationListene
     }
 
     // Phase 2 composable screen effects (GL EffectComposer parity). Color grade takes
-    // the raw slider values (brightness/contrast -100..100, gamma 0.5..3.0); neutral
-    // (0,0,1) is a no-op. FXAA/Toon/CRT/NTSC are binary. Drawer-only / session-live.
-    public void setScreenEffects(float brightness, float contrast, float gamma,
+    // the raw slider values (brightness/contrast -100..100, gamma 0.5..3.0, saturation
+    // 0..200 percent); neutral (0,0,1,100) is a no-op. FXAA/Toon/CRT/NTSC are binary.
+    // Drawer-only / session-live.
+    public void setScreenEffects(float brightness, float contrast, float gamma, float saturation,
                                  boolean fxaa, boolean toon, boolean crt, boolean ntsc) {
         pendingColorBrightness = brightness;
         pendingColorContrast   = contrast;
         pendingColorGamma      = gamma;
+        pendingColorSaturation = saturation;
         pendingFxaaEnabled = fxaa;
         pendingToonEnabled = toon;
         pendingCrtEnabled  = crt;
         pendingNtscEnabled = ntsc;
         synchronized (lock) {
             if (nativeHandle != 0) {
-                nativeSetColorGrade(nativeHandle, brightness, contrast, gamma);
+                nativeSetColorGrade(nativeHandle, brightness, contrast, gamma, saturation);
                 nativeSetFxaa(nativeHandle, fxaa);
                 nativeSetToon(nativeHandle, toon);
                 nativeSetCrt(nativeHandle, crt);
@@ -1021,6 +1023,7 @@ public class VulkanRenderer implements WindowManager.OnWindowModificationListene
     private float   pendingColorBrightness = 0.0f;  // -100..100 slider; 0 = neutral
     private float   pendingColorContrast   = 0.0f;  // -100..100 slider; 0 = neutral
     private float   pendingColorGamma      = 1.0f;  // 0.5..3.0 slider; 1.0 = neutral
+    private float   pendingColorSaturation = 100.0f;// 0..200 slider; 100 = neutral
     private boolean pendingSwapRB         = false;
     // Native LSFG frame generation. Replayed after a surface reattach, like
     // every other renderer setting, so arming survives a background cycle.

@@ -6945,10 +6945,11 @@ public class XServerDisplayActivity extends AppCompatActivity {
             XServerDialogState.INSTANCE.setHdrVkEnabled(vkHdrEnabled);
             // Phase 2 screen effects (GL parity) — drawer-only / session-live, default
             // off / neutral grade. Seed the renderer and mirror into the drawer state.
-            vkRenderer.setScreenEffects(0f, 0f, 1.0f, false, false, false, false);
+            vkRenderer.setScreenEffects(0f, 0f, 1.0f, 100f, false, false, false, false);
             XServerDialogState.INSTANCE.setVkBrightness(0f);
             XServerDialogState.INSTANCE.setVkContrast(0f);
             XServerDialogState.INSTANCE.setVkGamma(1.0f);
+            XServerDialogState.INSTANCE.setVkSaturation(100f);
             XServerDialogState.INSTANCE.setVkFxaa(false);
             XServerDialogState.INSTANCE.setVkToon(false);
             XServerDialogState.INSTANCE.setVkCrt(false);
@@ -7539,8 +7540,8 @@ public class XServerDisplayActivity extends AppCompatActivity {
         vkr.setUpscaler(0);                          ds.setUpscalerMode(0);
         vkr.setCas(false, ds.getCasSharpness().getValue()); ds.setCasEnabled(false);
         vkr.setHdr(false);                           ds.setHdrVkEnabled(false);
-        vkr.setScreenEffects(0f, 0f, 1.0f, false, false, false, false);
-        ds.setVkBrightness(0f); ds.setVkContrast(0f); ds.setVkGamma(1.0f);
+        vkr.setScreenEffects(0f, 0f, 1.0f, 100f, false, false, false, false);
+        ds.setVkBrightness(0f); ds.setVkContrast(0f); ds.setVkGamma(1.0f); ds.setVkSaturation(100f);
         ds.setVkFxaa(false); ds.setVkToon(false); ds.setVkCrt(false); ds.setVkNtsc(false);
     }
 
@@ -7565,8 +7566,8 @@ public class XServerDisplayActivity extends AppCompatActivity {
         if (hdr != null) comp.removeEffect(hdr);
         ds.setSgsrEnabled(false); ds.setSgsrSharpness(50); ds.setHdrEnabled(false);
         // Screen effects: color grade neutral + FXAA/CRT/Toon/NTSC off.
-        applyScreenEffects(glr, 0f, 0f, 1.0f, false, false, false, false);
-        ds.setSeBrightness(0f); ds.setSeContrast(0f); ds.setSeGamma(1.0f);
+        applyScreenEffects(glr, 0f, 0f, 1.0f, 100f, false, false, false, false);
+        ds.setSeBrightness(0f); ds.setSeContrast(0f); ds.setSeGamma(1.0f); ds.setSeSaturation(100f);
         ds.setSeFxaa(false); ds.setSeCrt(false); ds.setSeToon(false); ds.setSeNtsc(false);
         // Terminal debanding off.
         comp.setDeband(false, 100);
@@ -7658,11 +7659,12 @@ public class XServerDisplayActivity extends AppCompatActivity {
                 vkr.setUpscaleSharpness(sharpness);
                 persistExtraInt("upscaleSharpness", sharpness); // remember per game (#382)
             };
-            ds.onVulkanScreenEffectsApply = (brightness, contrast, gamma, fxaa, toon, crt, ntsc) -> {
-                // color grade neutral = brightness 0 / contrast 0 / gamma 1.0
-                if (fxaa || toon || crt || ntsc || brightness != 0f || contrast != 0f || gamma != 1.0f)
+            ds.onVulkanScreenEffectsApply = (brightness, contrast, gamma, saturation, fxaa, toon, crt, ntsc) -> {
+                // color grade neutral = brightness 0 / contrast 0 / gamma 1.0 / saturation 100
+                if (fxaa || toon || crt || ntsc || brightness != 0f || contrast != 0f || gamma != 1.0f
+                        || saturation != 100f)
                     disableNativeRenderingForPreset();
-                vkr.setScreenEffects(brightness, contrast, gamma, fxaa, toon, crt, ntsc);
+                vkr.setScreenEffects(brightness, contrast, gamma, saturation, fxaa, toon, crt, ntsc);
             };
         } else {
             ds.onUpscalerApply = null;
@@ -7986,6 +7988,7 @@ public class XServerDisplayActivity extends AppCompatActivity {
         ds.setSeBrightness(ce   != null ? ce.getBrightness() * 100f : 0f);
         ds.setSeContrast  (ce   != null ? ce.getContrast()   * 100f : 0f);
         ds.setSeGamma     (ce   != null ? ce.getGamma()             : 1.0f);
+        ds.setSeSaturation(ce   != null ? ce.getSaturation() * 100f : 100f);
         ds.setSeFxaa      (fxaa != null);
         ds.setSeCrt       (crt  != null);
         ds.setSeToon      (toon != null);
@@ -8003,13 +8006,14 @@ public class XServerDisplayActivity extends AppCompatActivity {
         }
         ds.setSeSelectedProfile(selIdx);
 
-        ds.onScreenEffectsApply = (brightness, contrast, gamma, fxaaEn, crtEn, toonEn, ntscEn, profileIndex) -> {
+        ds.onScreenEffectsApply = (brightness, contrast, gamma, saturation, fxaaEn, crtEn, toonEn, ntscEn, profileIndex) -> {
             if (glRenderer == null) return;
             // Direction A: any non-neutral screen effect runs in the EffectComposer, which GL native
             // bypasses — so engaging one turns Native Rendering off (guarded; no-op when already off).
-            if (fxaaEn || crtEn || toonEn || ntscEn || brightness != 0f || contrast != 0f || gamma != 1.0f)
+            if (fxaaEn || crtEn || toonEn || ntscEn || brightness != 0f || contrast != 0f || gamma != 1.0f
+                    || saturation != 100f)
                 disableNativeRenderingForPreset();
-            applyScreenEffects(glRenderer, brightness, contrast, gamma, fxaaEn, crtEn, toonEn, ntscEn);
+            applyScreenEffects(glRenderer, brightness, contrast, gamma, saturation, fxaaEn, crtEn, toonEn, ntscEn);
             if (profileIndex > 0 && profileIndex - 1 < seProfileNames.size()) {
                 String name = seProfileNames.get(profileIndex - 1);
                 saveScreenEffectProfile(name, brightness, contrast, gamma, fxaaEn, crtEn, toonEn, ntscEn);
@@ -11252,6 +11256,7 @@ return true;
         ds.setSeBrightness(ce   != null ? ce.getBrightness() * 100f : 0f);
         ds.setSeContrast  (ce   != null ? ce.getContrast()   * 100f : 0f);
         ds.setSeGamma     (ce   != null ? ce.getGamma()             : 1.0f);
+        ds.setSeSaturation(ce   != null ? ce.getSaturation() * 100f : 100f);
         ds.setSeFxaa      (fxaa != null);
         ds.setSeCrt       (crt  != null);
         ds.setSeToon      (toon != null);
@@ -11270,9 +11275,9 @@ return true;
         }
         ds.setSeSelectedProfile(selIdx);
 
-        ds.onScreenEffectsApply = (brightness, contrast, gamma, fxaaEn, crtEn, toonEn, ntscEn, profileIndex) -> {
+        ds.onScreenEffectsApply = (brightness, contrast, gamma, saturation, fxaaEn, crtEn, toonEn, ntscEn, profileIndex) -> {
             if (r == null) return;
-            applyScreenEffects(r, brightness, contrast, gamma, fxaaEn, crtEn, toonEn, ntscEn);
+            applyScreenEffects(r, brightness, contrast, gamma, saturation, fxaaEn, crtEn, toonEn, ntscEn);
             if (profileIndex > 0 && profileIndex - 1 < profileNames.size()) {
                 String name = profileNames.get(profileIndex - 1);
                 saveScreenEffectProfile(name, brightness, contrast, gamma, fxaaEn, crtEn, toonEn, ntscEn);
@@ -11306,16 +11311,21 @@ return true;
         ds.show(XServerDialogState.ActiveDialog.SCREEN_EFFECTS);
     }
 
+    // saturation is the 0..200 percent slider (100 = neutral), matching the Vulkan path; the
+    // ColorEffect shader takes it normalised, so it is divided by 100 alongside brightness and
+    // contrast. A fully neutral grade is (0, 0, 1.0, 100) and removes the effect entirely.
     private void applyScreenEffects(GLRenderer r, float brightness, float contrast, float gamma,
+                                    float saturation,
                                     boolean fxaaEn, boolean crtEn, boolean toonEn, boolean ntscEn) {
         ColorEffect ce = (ColorEffect) r.getEffectComposer().getEffect(ColorEffect.class);
-        if (brightness == 0 && contrast == 0 && gamma == 1.0f) {
+        if (brightness == 0 && contrast == 0 && gamma == 1.0f && saturation == 100f) {
             if (ce != null) r.getEffectComposer().removeEffect(ce);
         } else {
             if (ce == null) ce = new ColorEffect();
             ce.setBrightness(brightness / 100f);
             ce.setContrast(contrast / 100f);
             ce.setGamma(gamma);
+            ce.setSaturation(saturation / 100f);
             r.getEffectComposer().addEffect(ce);
         }
         FXAAEffect fxaa = (FXAAEffect) r.getEffectComposer().getEffect(FXAAEffect.class);

@@ -318,11 +318,12 @@ Java_com_winlator_star_renderer_vulkan_VulkanRenderer_nativeSetNtsc(JNIEnv*, job
     auto* r = reinterpret_cast<VulkanRendererContext*>(handle);
     if (r) r->setNtsc(enabled == JNI_TRUE);
 }
-// Color grade: brightness/contrast as the raw -100..100 sliders, gamma 0.5..3.0.
+// Color grade: brightness/contrast as the raw -100..100 sliders, gamma 0.5..3.0,
+// saturation as the raw 0..200 percent slider (100 = neutral).
 extern "C" JNIEXPORT void JNICALL
-Java_com_winlator_star_renderer_vulkan_VulkanRenderer_nativeSetColorGrade(JNIEnv*, jobject, jlong handle, jfloat brightness, jfloat contrast, jfloat gamma) {
+Java_com_winlator_star_renderer_vulkan_VulkanRenderer_nativeSetColorGrade(JNIEnv*, jobject, jlong handle, jfloat brightness, jfloat contrast, jfloat gamma, jfloat saturation) {
     auto* r = reinterpret_cast<VulkanRendererContext*>(handle);
-    if (r) r->setColorGrade((float)brightness, (float)contrast, (float)gamma);
+    if (r) r->setColorGrade((float)brightness, (float)contrast, (float)gamma, (float)saturation);
 }
 
 extern "C" JNIEXPORT void JNICALL

@@ -957,10 +957,105 @@ private fun GraphicsContent(state: XServerDrawerState) {
         val initGlUpscalerMode by XServerDialogState.glUpscalerMode.collectAsState()
         var glUpscalerMode by remember(initGlUpscalerMode) { mutableIntStateOf(initGlUpscalerMode) }
 
+        // ---- OpenGL: SGSR / HDR + Screen Effects (GL EffectComposer features) ----
+        val initSgsrEnabled   by XServerDialogState.sgsrEnabled.collectAsState()
+        val initSgsrSharpness by XServerDialogState.sgsrSharpness.collectAsState()
+        val initHdrEnabled    by XServerDialogState.hdrEnabled.collectAsState()
+        var sgsrEnabled   by remember(initSgsrEnabled)   { mutableStateOf(initSgsrEnabled) }
+        var sgsrSharpness by remember(initSgsrSharpness) { mutableIntStateOf(initSgsrSharpness) }
+        var hdrEnabled    by remember(initHdrEnabled)    { mutableStateOf(initHdrEnabled) }
+
+        // Screen-effect (colour grade + shader toggle) state. Declared up here, ahead of the
+        // first control, because the Looks row below drives the sharpening / debanding /
+        // scaling controls that are EMITTED above the Screen Effects header.
+        val seBrightness by XServerDialogState.seBrightness.collectAsState()
+        val seContrast by XServerDialogState.seContrast.collectAsState()
+        val seGamma by XServerDialogState.seGamma.collectAsState()
+        val seSaturation by XServerDialogState.seSaturation.collectAsState()
+        val seFxaa by XServerDialogState.seFxaa.collectAsState()
+        val seCrt by XServerDialogState.seCrt.collectAsState()
+        val seToon by XServerDialogState.seToon.collectAsState()
+        val seNtsc by XServerDialogState.seNtsc.collectAsState()
+        val seDeband by XServerDialogState.debandEnabled.collectAsState()
+        var localBrightness by remember(seBrightness) { mutableFloatStateOf(seBrightness) }
+        var localContrast by remember(seContrast) { mutableFloatStateOf(seContrast) }
+        var localGamma by remember(seGamma) { mutableFloatStateOf(seGamma) }
+        var localSaturation by remember(seSaturation) { mutableFloatStateOf(seSaturation) }
+        var localFxaa by remember(seFxaa) { mutableStateOf(seFxaa) }
+        var localCrt by remember(seCrt) { mutableStateOf(seCrt) }
+        var localToon by remember(seToon) { mutableStateOf(seToon) }
+        var localNtsc by remember(seNtsc) { mutableStateOf(seNtsc) }
+
+        fun applySe() {
+            XServerDialogState.onScreenEffectsApply?.invoke(localBrightness, localContrast, localGamma, localSaturation, localFxaa, localCrt, localToon, localNtsc, 0)
+        }
+
+        // ---- Looks: one-tap presets over the controls in this whole section ----------------
+        // The chip row is only a shortcut: it writes the SAME local state and fires the SAME
+        // appliers the sliders and toggles below use, so nothing here is a second code path.
+        // `selectedLook` is seeded by matching the live values, so a session launched with
+        // effects already on honestly shows "Custom" rather than claiming "Off".
+        var selectedLook by remember {
+            mutableStateOf(
+                ScreenEffectLooks.indexOfMatch(
+                    seBrightness, seContrast, seGamma, seSaturation,
+                    if (initSgsrEnabled) initSgsrSharpness else 0,
+                    seFxaa, seCrt, seToon, seNtsc, seDeband, initGlUpscalerMode
+                )
+            )
+        }
+
+        fun applyGlLook(index: Int) {
+            val look = ScreenEffectLooks.LOOKS[index]
+            selectedLook = index
+            // 1. Colour grade + the four shader toggles -> onScreenEffectsApply.
+            localBrightness = look.brightness
+            localContrast   = look.contrast
+            localGamma      = look.gamma
+            localSaturation = look.saturation.toFloat()
+            localFxaa = look.fxaa; localCrt = look.crt; localToon = look.toon; localNtsc = look.ntsc
+            XServerDialogState.setSeBrightness(localBrightness)
+            XServerDialogState.setSeContrast(localContrast)
+            XServerDialogState.setSeGamma(localGamma)
+            XServerDialogState.setSeSaturation(localSaturation)
+            XServerDialogState.setSeFxaa(localFxaa)
+            XServerDialogState.setSeCrt(localCrt)
+            XServerDialogState.setSeToon(localToon)
+            XServerDialogState.setSeNtsc(localNtsc)
+            applySe()
+            // 2. Sharpening -> pushSgsrUpdate. cas == 0 means the pass is OFF; a non-zero level
+            //    also moves the slider. Leaving the level alone at 0 keeps the user's last value
+            //    under the (now hidden) slider instead of zeroing it.
+            sgsrEnabled = look.cas > 0
+            if (look.cas > 0) sgsrSharpness = look.cas
+            XServerDialogState.setSgsrEnabled(sgsrEnabled)
+            XServerDialogState.setSgsrSharpness(sgsrSharpness)
+            pushSgsrUpdate(sgsrEnabled, sgsrSharpness, hdrEnabled)
+            // 3. Terminal debanding -> onDebandApply (DebandControls re-seeds off the flow).
+            XServerDialogState.setDebandEnabled(look.deband)
+            XServerDialogState.onDebandApply?.invoke(look.deband, XServerDialogState.debandStrength.value)
+            // 4. Scaling mode ONLY when the Look actually names one; otherwise the user's
+            //    scaling choice is left exactly as it was.
+            look.scalingMode?.let { mode ->
+                glUpscalerMode = mode
+                XServerDialogState.setGlUpscalerMode(mode)
+                XServerDialogState.onGlUpscalerApply?.invoke(mode)
+            }
+        }
+
+        // A manual move of a control the active Look OWNS drops back to "Custom". Controls no
+        // Look touches (HDR, the upscaler's own sharpness) deliberately do not.
+        fun lookTouched() { selectedLook = null }
+        fun lookTouchedScaling() {
+            if (ScreenEffectLooks.LOOKS.getOrNull(selectedLook ?: -1)?.scalingMode != null) selectedLook = null
+        }
+
         Text("Scaling mode", color = glHeaderColor, fontWeight = FontWeight.SemiBold, fontSize = 13.sp)
         Spacer(Modifier.height(8.dp))
         UpscalerModeButtons(glUpscalerMode, glEnabled) {
             glUpscalerMode = it
+            XServerDialogState.setGlUpscalerMode(it)
+            lookTouchedScaling()
             XServerDialogState.onGlUpscalerApply?.invoke(it)
         }
         // "Sharpness" drives SGSR EdgeSharpness / FSR RCAS / CAS / NIS, for the sharpening modes.
@@ -981,60 +1076,63 @@ private fun GraphicsContent(state: XServerDrawerState) {
 
         HorizontalDivider(color = MaterialTheme.colorScheme.outline, modifier = Modifier.padding(vertical = 6.dp))
 
-        // ---- OpenGL: SGSR / HDR + Screen Effects (GL EffectComposer features) ----
-        val initSgsrEnabled   by XServerDialogState.sgsrEnabled.collectAsState()
-        val initSgsrSharpness by XServerDialogState.sgsrSharpness.collectAsState()
-        val initHdrEnabled    by XServerDialogState.hdrEnabled.collectAsState()
-        var sgsrEnabled   by remember(initSgsrEnabled)   { mutableStateOf(initSgsrEnabled) }
-        var sgsrSharpness by remember(initSgsrSharpness) { mutableIntStateOf(initSgsrSharpness) }
-        var hdrEnabled    by remember(initHdrEnabled)    { mutableStateOf(initHdrEnabled) }
-
-        ToggleRow("Sharpen (CAS)", sgsrEnabled, glEnabled) { sgsrEnabled = it; pushSgsrUpdate(sgsrEnabled, sgsrSharpness, hdrEnabled) }
+        ToggleRow("Sharpen (CAS)", sgsrEnabled, glEnabled) {
+            sgsrEnabled = it
+            XServerDialogState.setSgsrEnabled(it)
+            lookTouched()
+            pushSgsrUpdate(sgsrEnabled, sgsrSharpness, hdrEnabled)
+        }
         if (sgsrEnabled) {
             Spacer(Modifier.height(4.dp))
             // Standalone CAS sharpen: always snapped to 5 stops {0,25,50,75,100}, stop 0 = OFF.
+            // (A Look may park it between stops — the effect is continuous; the snap only bites
+            // when the user drags it.)
             IntSlider("Sharpness", sgsrSharpness, 0..100,
-                onValueChange = { sgsrSharpness = it },
-                onValueChangeFinished = { pushSgsrUpdate(sgsrEnabled, sgsrSharpness, hdrEnabled) },
+                onValueChange = { sgsrSharpness = it; lookTouched() },
+                onValueChangeFinished = {
+                    XServerDialogState.setSgsrSharpness(sgsrSharpness)
+                    pushSgsrUpdate(sgsrEnabled, sgsrSharpness, hdrEnabled)
+                },
                 steps = 3, enabled = glEnabled)
         }
         ToggleRow("HDR", hdrEnabled, glEnabled) { hdrEnabled = it; pushSgsrUpdate(sgsrEnabled, sgsrSharpness, hdrEnabled) }
 
         // Terminal debanding (TPDF dither) — kills 8-bit gradient banding. Drawer-only / session-live.
-        DebandControls(glEnabled)
+        DebandControls(glEnabled) { lookTouched() }
 
         HorizontalDivider(color = MaterialTheme.colorScheme.outline, modifier = Modifier.padding(vertical = 6.dp))
 
         Text("Screen Effects", color = glHeaderColor, fontWeight = FontWeight.SemiBold, fontSize = 13.sp)
         Spacer(Modifier.height(4.dp))
 
-        val seBrightness by XServerDialogState.seBrightness.collectAsState()
-        val seContrast by XServerDialogState.seContrast.collectAsState()
-        val seGamma by XServerDialogState.seGamma.collectAsState()
-        val seFxaa by XServerDialogState.seFxaa.collectAsState()
-        val seCrt by XServerDialogState.seCrt.collectAsState()
-        val seToon by XServerDialogState.seToon.collectAsState()
-        val seNtsc by XServerDialogState.seNtsc.collectAsState()
-        var localBrightness by remember(seBrightness) { mutableFloatStateOf(seBrightness) }
-        var localContrast by remember(seContrast) { mutableFloatStateOf(seContrast) }
-        var localGamma by remember(seGamma) { mutableFloatStateOf(seGamma) }
-        var localFxaa by remember(seFxaa) { mutableStateOf(seFxaa) }
-        var localCrt by remember(seCrt) { mutableStateOf(seCrt) }
-        var localToon by remember(seToon) { mutableStateOf(seToon) }
-        var localNtsc by remember(seNtsc) { mutableStateOf(seNtsc) }
+        LooksRow(
+            selected = selectedLook,
+            enabled = glEnabled,
+            onPick = { applyGlLook(it) }
+        )
 
-        fun applySe() {
-            XServerDialogState.onScreenEffectsApply?.invoke(localBrightness, localContrast, localGamma, localFxaa, localCrt, localToon, localNtsc, 0)
-        }
+        LabeledSlider("Brightness", localBrightness, -100f..100f,
+            { localBrightness = it; lookTouched(); applySe() },
+            onValueChangeFinished = { XServerDialogState.setSeBrightness(localBrightness) },
+            enabled = glEnabled)
+        LabeledSlider("Contrast", localContrast, -100f..100f,
+            { localContrast = it; lookTouched(); applySe() },
+            onValueChangeFinished = { XServerDialogState.setSeContrast(localContrast) },
+            enabled = glEnabled)
+        LabeledSlider("Gamma", localGamma, 0.5f..3.0f,
+            { localGamma = it; lookTouched(); applySe() },
+            onValueChangeFinished = { XServerDialogState.setSeGamma(localGamma) },
+            enabled = glEnabled, format = { "%.2f".format(it) })
+        // Saturation: 0..200 percent, 100 = neutral (grey at 0, 2x at 200).
+        LabeledSlider("Saturation", localSaturation, 0f..200f,
+            { localSaturation = it; lookTouched(); applySe() },
+            onValueChangeFinished = { XServerDialogState.setSeSaturation(localSaturation) },
+            enabled = glEnabled)
 
-        LabeledSlider("Brightness", localBrightness, -100f..100f, { localBrightness = it; applySe() }, enabled = glEnabled)
-        LabeledSlider("Contrast", localContrast, -100f..100f, { localContrast = it; applySe() }, enabled = glEnabled)
-        LabeledSlider("Gamma", localGamma, 0.5f..3.0f, { localGamma = it; applySe() }, enabled = glEnabled, format = { "%.2f".format(it) })
-
-        SeShaderToggle("FXAA", localFxaa, glEnabled) { localFxaa = it; applySe() }
-        SeShaderToggle("CRT", localCrt, glEnabled) { localCrt = it; applySe() }
-        SeShaderToggle("Toon", localToon, glEnabled) { localToon = it; applySe() }
-        SeShaderToggle("NTSC", localNtsc, glEnabled) { localNtsc = it; applySe() }
+        SeShaderToggle("FXAA", localFxaa, glEnabled) { localFxaa = it; XServerDialogState.setSeFxaa(it); lookTouched(); applySe() }
+        SeShaderToggle("CRT", localCrt, glEnabled) { localCrt = it; XServerDialogState.setSeCrt(it); lookTouched(); applySe() }
+        SeShaderToggle("Toon", localToon, glEnabled) { localToon = it; XServerDialogState.setSeToon(it); lookTouched(); applySe() }
+        SeShaderToggle("NTSC", localNtsc, glEnabled) { localNtsc = it; XServerDialogState.setSeNtsc(it); lookTouched(); applySe() }
 
         HorizontalDivider(color = MaterialTheme.colorScheme.outline, modifier = Modifier.padding(vertical = 6.dp))
     }
@@ -1047,10 +1145,103 @@ private fun GraphicsContent(state: XServerDrawerState) {
         val initUpscalerMode by XServerDialogState.upscalerMode.collectAsState()
         var upscalerMode by remember(initUpscalerMode) { mutableIntStateOf(initUpscalerMode) }
 
+        // ---- Composable post effects (layer on top of any scaling mode) ----
+        val initCasEnabled   by XServerDialogState.casEnabled.collectAsState()
+        val initCasSharpness by XServerDialogState.casSharpness.collectAsState()
+        val initHdrVkEnabled by XServerDialogState.hdrVkEnabled.collectAsState()
+        var casEnabled   by remember(initCasEnabled)   { mutableStateOf(initCasEnabled) }
+        var casSharpness by remember(initCasSharpness) { mutableIntStateOf(initCasSharpness) }
+        var hdrVkEnabled by remember(initHdrVkEnabled) { mutableStateOf(initHdrVkEnabled) }
+
+        // ---- Screen Effects (GL EffectComposer parity, ported to the Vulkan post
+        //      chain). Color grade is always-applied via the sliders (neutral = no-op);
+        //      FXAA/Toon/CRT/NTSC are toggles. Drawer-only / session-live. ----
+        //      Declared up here, ahead of the first control, because the Looks row below
+        //      drives the CAS / debanding / scaling controls emitted above its header.
+        val initVkBrightness by XServerDialogState.vkBrightness.collectAsState()
+        val initVkContrast   by XServerDialogState.vkContrast.collectAsState()
+        val initVkGamma      by XServerDialogState.vkGamma.collectAsState()
+        val initVkSaturation by XServerDialogState.vkSaturation.collectAsState()
+        val initVkFxaa       by XServerDialogState.vkFxaa.collectAsState()
+        val initVkToon       by XServerDialogState.vkToon.collectAsState()
+        val initVkCrt        by XServerDialogState.vkCrt.collectAsState()
+        val initVkNtsc       by XServerDialogState.vkNtsc.collectAsState()
+        val initVkDeband     by XServerDialogState.debandEnabled.collectAsState()
+        var vkBrightness by remember(initVkBrightness) { mutableFloatStateOf(initVkBrightness) }
+        var vkContrast   by remember(initVkContrast)   { mutableFloatStateOf(initVkContrast) }
+        var vkGamma      by remember(initVkGamma)      { mutableFloatStateOf(initVkGamma) }
+        var vkSaturation by remember(initVkSaturation) { mutableFloatStateOf(initVkSaturation) }
+        var vkFxaa       by remember(initVkFxaa)       { mutableStateOf(initVkFxaa) }
+        var vkToon       by remember(initVkToon)       { mutableStateOf(initVkToon) }
+        var vkCrt        by remember(initVkCrt)        { mutableStateOf(initVkCrt) }
+        var vkNtsc       by remember(initVkNtsc)       { mutableStateOf(initVkNtsc) }
+
+        fun applyVkSe() {
+            XServerDialogState.onVulkanScreenEffectsApply?.invoke(
+                vkBrightness, vkContrast, vkGamma, vkSaturation, vkFxaa, vkToon, vkCrt, vkNtsc)
+        }
+
+        // ---- Looks: one-tap presets, same table as the OpenGL block ------------------------
+        // Writes the same local state and fires the same appliers the controls below use.
+        var selectedLook by remember {
+            mutableStateOf(
+                ScreenEffectLooks.indexOfMatch(
+                    initVkBrightness, initVkContrast, initVkGamma, initVkSaturation,
+                    if (initCasEnabled) initCasSharpness else 0,
+                    initVkFxaa, initVkCrt, initVkToon, initVkNtsc, initVkDeband, initUpscalerMode
+                )
+            )
+        }
+
+        fun applyVkLook(index: Int) {
+            val look = ScreenEffectLooks.LOOKS[index]
+            selectedLook = index
+            // 1. Colour grade + the four shader toggles -> onVulkanScreenEffectsApply.
+            vkBrightness = look.brightness
+            vkContrast   = look.contrast
+            vkGamma      = look.gamma
+            vkSaturation = look.saturation.toFloat()
+            vkFxaa = look.fxaa; vkCrt = look.crt; vkToon = look.toon; vkNtsc = look.ntsc
+            XServerDialogState.setVkBrightness(vkBrightness)
+            XServerDialogState.setVkContrast(vkContrast)
+            XServerDialogState.setVkGamma(vkGamma)
+            XServerDialogState.setVkSaturation(vkSaturation)
+            XServerDialogState.setVkFxaa(vkFxaa)
+            XServerDialogState.setVkCrt(vkCrt)
+            XServerDialogState.setVkToon(vkToon)
+            XServerDialogState.setVkNtsc(vkNtsc)
+            applyVkSe()
+            // 2. Sharpening -> onCasApply. cas == 0 means the CAS pass is OFF; a non-zero level
+            //    also moves the slider (0 leaves the user's last level under the hidden slider).
+            casEnabled = look.cas > 0
+            if (look.cas > 0) casSharpness = look.cas
+            XServerDialogState.setCasEnabled(casEnabled)
+            XServerDialogState.setCasSharpness(casSharpness)
+            XServerDialogState.onCasApply?.invoke(casEnabled, casSharpness)
+            // 3. Terminal debanding -> onDebandApply (DebandControls re-seeds off the flow).
+            XServerDialogState.setDebandEnabled(look.deband)
+            XServerDialogState.onDebandApply?.invoke(look.deband, XServerDialogState.debandStrength.value)
+            // 4. Scaling mode ONLY when the Look actually names one.
+            look.scalingMode?.let { mode ->
+                upscalerMode = mode
+                XServerDialogState.setUpscalerMode(mode)
+                XServerDialogState.onUpscalerApply?.invoke(mode)
+            }
+        }
+
+        // A manual move of a control the active Look OWNS drops back to "Custom". Controls no
+        // Look touches (HDR, the upscaler's own sharpness) deliberately do not.
+        fun lookTouched() { selectedLook = null }
+        fun lookTouchedScaling() {
+            if (ScreenEffectLooks.LOOKS.getOrNull(selectedLook ?: -1)?.scalingMode != null) selectedLook = null
+        }
+
         Text("Scaling mode", color = accent, fontWeight = FontWeight.SemiBold, fontSize = 13.sp)
         Spacer(Modifier.height(8.dp))
         UpscalerModeButtons(upscalerMode, true) {
             upscalerMode = it
+            XServerDialogState.setUpscalerMode(it)
+            lookTouchedScaling()
             XServerDialogState.onUpscalerApply?.invoke(it)
         }
 
@@ -1067,21 +1258,16 @@ private fun GraphicsContent(state: XServerDrawerState) {
 
         Spacer(Modifier.height(4.dp))
 
-        // ---- Composable post effects (layer on top of any scaling mode) ----
-        val initCasEnabled   by XServerDialogState.casEnabled.collectAsState()
-        val initCasSharpness by XServerDialogState.casSharpness.collectAsState()
-        val initHdrVkEnabled by XServerDialogState.hdrVkEnabled.collectAsState()
-        var casEnabled   by remember(initCasEnabled)   { mutableStateOf(initCasEnabled) }
-        var casSharpness by remember(initCasSharpness) { mutableIntStateOf(initCasSharpness) }
-        var hdrVkEnabled by remember(initHdrVkEnabled) { mutableStateOf(initHdrVkEnabled) }
-
         ToggleRow("CAS", casEnabled, true) {
             casEnabled = it
+            XServerDialogState.setCasEnabled(it)
+            lookTouched()
             XServerDialogState.onCasApply?.invoke(casEnabled, casSharpness)
         }
         if (casEnabled) {
             Spacer(Modifier.height(4.dp))
-            IntSlider("CAS Sharpness", casSharpness, 0..100, { casSharpness = it }, {
+            IntSlider("CAS Sharpness", casSharpness, 0..100, { casSharpness = it; lookTouched() }, {
+                XServerDialogState.setCasSharpness(casSharpness)
                 XServerDialogState.onCasApply?.invoke(casEnabled, casSharpness)
             })
         }
@@ -1091,48 +1277,45 @@ private fun GraphicsContent(state: XServerDrawerState) {
         }
 
         // Terminal debanding (TPDF dither) — kills 8-bit gradient banding. Drawer-only / session-live.
-        DebandControls()
+        DebandControls(onUserChange = { lookTouched() })
 
         HorizontalDivider(color = MaterialTheme.colorScheme.outline, modifier = Modifier.padding(vertical = 6.dp))
 
-        // ---- Screen Effects (GL EffectComposer parity, ported to the Vulkan post
-        //      chain). Color grade is always-applied via the sliders (neutral = no-op);
-        //      FXAA/Toon/CRT/NTSC are toggles. Drawer-only / session-live. ----
         Text("Screen Effects", color = accent, fontWeight = FontWeight.SemiBold, fontSize = 13.sp)
         Spacer(Modifier.height(4.dp))
 
-        val initVkBrightness by XServerDialogState.vkBrightness.collectAsState()
-        val initVkContrast   by XServerDialogState.vkContrast.collectAsState()
-        val initVkGamma      by XServerDialogState.vkGamma.collectAsState()
-        val initVkFxaa       by XServerDialogState.vkFxaa.collectAsState()
-        val initVkToon       by XServerDialogState.vkToon.collectAsState()
-        val initVkCrt        by XServerDialogState.vkCrt.collectAsState()
-        val initVkNtsc       by XServerDialogState.vkNtsc.collectAsState()
-        var vkBrightness by remember(initVkBrightness) { mutableFloatStateOf(initVkBrightness) }
-        var vkContrast   by remember(initVkContrast)   { mutableFloatStateOf(initVkContrast) }
-        var vkGamma      by remember(initVkGamma)      { mutableFloatStateOf(initVkGamma) }
-        var vkFxaa       by remember(initVkFxaa)       { mutableStateOf(initVkFxaa) }
-        var vkToon       by remember(initVkToon)       { mutableStateOf(initVkToon) }
-        var vkCrt        by remember(initVkCrt)        { mutableStateOf(initVkCrt) }
-        var vkNtsc       by remember(initVkNtsc)       { mutableStateOf(initVkNtsc) }
+        LooksRow(
+            selected = selectedLook,
+            enabled = true,
+            onPick = { applyVkLook(it) }
+        )
 
-        fun applyVkSe() {
-            XServerDialogState.onVulkanScreenEffectsApply?.invoke(
-                vkBrightness, vkContrast, vkGamma, vkFxaa, vkToon, vkCrt, vkNtsc)
-        }
-
-        LabeledSlider("Brightness", vkBrightness, -100f..100f, { vkBrightness = it; applyVkSe() }, enabled = true)
-        LabeledSlider("Contrast", vkContrast, -100f..100f, { vkContrast = it; applyVkSe() }, enabled = true)
-        LabeledSlider("Gamma", vkGamma, 0.5f..3.0f, { vkGamma = it; applyVkSe() }, enabled = true, format = { "%.2f".format(it) })
+        LabeledSlider("Brightness", vkBrightness, -100f..100f,
+            { vkBrightness = it; lookTouched(); applyVkSe() },
+            onValueChangeFinished = { XServerDialogState.setVkBrightness(vkBrightness) },
+            enabled = true)
+        LabeledSlider("Contrast", vkContrast, -100f..100f,
+            { vkContrast = it; lookTouched(); applyVkSe() },
+            onValueChangeFinished = { XServerDialogState.setVkContrast(vkContrast) },
+            enabled = true)
+        LabeledSlider("Gamma", vkGamma, 0.5f..3.0f,
+            { vkGamma = it; lookTouched(); applyVkSe() },
+            onValueChangeFinished = { XServerDialogState.setVkGamma(vkGamma) },
+            enabled = true, format = { "%.2f".format(it) })
+        // Saturation: 0..200 percent, 100 = neutral (grey at 0, 2x at 200).
+        LabeledSlider("Saturation", vkSaturation, 0f..200f,
+            { vkSaturation = it; lookTouched(); applyVkSe() },
+            onValueChangeFinished = { XServerDialogState.setVkSaturation(vkSaturation) },
+            enabled = true)
 
         // Four independent shader flags with identical wiring — one row of chips instead of four
         // switch rows. Same applyVkSe() round-trip as before.
         ToggleChipGrid(
             listOf(
-                ToggleChipItem("FXAA", vkFxaa) { vkFxaa = it; applyVkSe() },
-                ToggleChipItem("Toon", vkToon) { vkToon = it; applyVkSe() },
-                ToggleChipItem("CRT", vkCrt) { vkCrt = it; applyVkSe() },
-                ToggleChipItem("NTSC", vkNtsc) { vkNtsc = it; applyVkSe() },
+                ToggleChipItem("FXAA", vkFxaa) { vkFxaa = it; XServerDialogState.setVkFxaa(it); lookTouched(); applyVkSe() },
+                ToggleChipItem("Toon", vkToon) { vkToon = it; XServerDialogState.setVkToon(it); lookTouched(); applyVkSe() },
+                ToggleChipItem("CRT", vkCrt) { vkCrt = it; XServerDialogState.setVkCrt(it); lookTouched(); applyVkSe() },
+                ToggleChipItem("NTSC", vkNtsc) { vkNtsc = it; XServerDialogState.setVkNtsc(it); lookTouched(); applyVkSe() },
             ),
             perRow = 4
         )
@@ -1957,14 +2140,21 @@ private fun GradientSlider(
 // GL and Vulkan graphics blocks. Reads/writes the single _debandEnabled/_debandStrength
 // state and fires onDebandApply; only one renderer block is shown per session, so the
 // shared state never conflicts. strength 0..200 (CPU maps /100 to LSBs, default 100 = 1 LSB).
+// onUserChange fires only for a HUMAN toggle/drag here, never for a value pushed in from
+// outside — the Screen Effect Looks row uses it to fall back to "Custom". Both controls also
+// write their value back into XServerDialogState, so the shared state stays the single source
+// of truth and a Look applied elsewhere (which can only reach this composable through those
+// flows) re-seeds these locals.
 @Composable
-private fun DebandControls(enabled: Boolean = true) {
+private fun DebandControls(enabled: Boolean = true, onUserChange: () -> Unit = {}) {
     val initDebandEnabled  by XServerDialogState.debandEnabled.collectAsState()
     val initDebandStrength by XServerDialogState.debandStrength.collectAsState()
     var debandEnabled  by remember(initDebandEnabled)  { mutableStateOf(initDebandEnabled) }
     var debandStrength by remember(initDebandStrength) { mutableIntStateOf(initDebandStrength) }
     ToggleRow("Debanding", debandEnabled, enabled) {
         debandEnabled = it
+        XServerDialogState.setDebandEnabled(it)
+        onUserChange()
         XServerDialogState.onDebandApply?.invoke(debandEnabled, debandStrength)
     }
     if (debandEnabled) {
@@ -1972,10 +2162,49 @@ private fun DebandControls(enabled: Boolean = true) {
         IntSlider("Dither strength", debandStrength, 0..200,
             onValueChange = { debandStrength = it },
             onValueChangeFinished = {
+                XServerDialogState.setDebandStrength(debandStrength)
                 XServerDialogState.onDebandApply?.invoke(debandEnabled, debandStrength)
             },
             enabled = enabled)
     }
+}
+
+// ───── Screen Effect Looks row ─────
+// The one-tap preset chips that head the Screen Effects section on both renderer paths.
+// Deliberately built out of the drawer's existing ToggleChipGrid so it reads as part of the
+// section rather than a new widget language: accent-filled when selected, black + accentDim
+// border otherwise, equal widths, three per row so the longest label ("Adaptive Sharpen")
+// wraps to two lines instead of overflowing the drawer's fixed 380dp shell.
+// `selected` == null means the user has moved one of the controls a Look owns — a trailing
+// "Custom" chip is appended and lights up. Tapping it does nothing (Custom is a state you
+// arrive at, not one you pick); tapping any Look re-applies it and drops the chip.
+@Composable
+private fun LooksRow(selected: Int?, enabled: Boolean, onPick: (Int) -> Unit) {
+    val looks = ScreenEffectLooks.LOOKS
+    val chips = looks.mapIndexed { i, look ->
+        ToggleChipItem(look.name, selected == i, enabled) { onPick(i) }
+    } + if (selected == null) listOf(ToggleChipItem(ScreenEffectLooks.CUSTOM_LABEL, true, enabled) { }) else emptyList<ToggleChipItem>()
+
+    Text(
+        "Looks",
+        color = MaterialTheme.colorScheme.onSurfaceVariant,
+        fontSize = 11.sp,
+        modifier = Modifier.padding(bottom = 4.dp)
+    )
+    ToggleChipGrid(chips, perRow = 3)
+    val note = if (selected != null) {
+        val look = looks[selected]
+        if (look.desc.isEmpty()) look.name else "${look.name} — ${look.desc}"
+    } else {
+        "Adjusted — everything below is yours. Tap a look to go back."
+    }
+    Text(
+        note,
+        color = MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = if (enabled) 0.9f else 0.4f),
+        fontSize = 11.sp,
+        lineHeight = 14.sp,
+        modifier = Modifier.padding(top = 6.dp, bottom = 6.dp)
+    )
 }
 
 // Fullscreen aspect-ratio selector (#71 Stage 2): 5 mode chips laid out as rows (3 + 2), same
