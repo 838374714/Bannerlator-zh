@@ -123,6 +123,7 @@ fun ContainersScreen(
     val message by vm.message.collectAsState()
     val layerUpdates by vm.layerUpdates.collectAsState()
     val layerSnapshots by vm.layerSnapshots.collectAsState()
+    val layerCurrentMissing by vm.layerCurrentMissing.collectAsState()
     val layerBusy by vm.layerBusy.collectAsState()
     val context = LocalContext.current
     val activity = context as Activity
@@ -242,7 +243,7 @@ fun ContainersScreen(
                         onBackupRestore = { saveFlow = SaveFlow.Fork(container) },
                         layerUpdate = layerUpdates[container.id],
                         layerSnapshot = layerSnapshots[container.id],
-                        onUpdateLayer = { target -> confirmDialog = ConfirmAction.UpdateLayer(container, target) },
+                        onUpdateLayer = { target -> confirmDialog = ConfirmAction.UpdateLayer(container, target, revertable = container.id !in layerCurrentMissing) },
                         onRevertLayer = { snapshot -> confirmDialog = ConfirmAction.RevertLayer(container, snapshot) },
                         onLayerHelp = { target ->
                             confirmDialog = ConfirmAction.LayerHelp(container, target, layerSnapshots[container.id])
@@ -373,8 +374,13 @@ fun ContainersScreen(
                                 "DXVK, FEX/Box64 and game-installed files are left as they are). Wine finishes its own " +
                                 "prefix update on the next launch.\n\n" +
                                 "What is kept: games, saves, shortcuts and container settings.\n\n" +
-                                "The $oldLabel layer stays installed and a backup of the registry is taken, so you can " +
-                                "revert from this menu. Make sure nothing is running in this container."
+                                (if (action.revertable)
+                                    "The $oldLabel layer stays installed and a backup of the registry is taken, so you can " +
+                                        "revert from this menu. "
+                                else
+                                    "The $oldLabel layer is no longer installed on this device, so this update cannot be " +
+                                        "reverted afterwards (a registry backup is still taken). ") +
+                                "Make sure nothing is running in this container."
                         )
                     },
                     confirmButton = {
@@ -420,7 +426,7 @@ fun ContainersScreen(
                     },
                     confirmButton = {
                         TextButton(onClick = {
-                            confirmDialog = ConfirmAction.UpdateLayer(action.container, action.target)
+                            confirmDialog = ConfirmAction.UpdateLayer(action.container, action.target, revertable = action.container.id !in layerCurrentMissing)
                         }) { Text("Update to $newLabel…") }
                     },
                     dismissButton = {
@@ -852,7 +858,7 @@ private sealed class ConfirmAction {
     data class Duplicate(val container: Container) : ConfirmAction()
     data class Remove(val container: Container) : ConfirmAction()
     /** In-place layer update to the installed entry [target] (ContainerLayerUpdater). */
-    data class UpdateLayer(val container: Container, val target: String) : ConfirmAction()
+    data class UpdateLayer(val container: Container, val target: String, val revertable: Boolean = true) : ConfirmAction()
     /** Revert a previous layer update using its [snapshot]. */
     data class RevertLayer(val container: Container, val snapshot: ContainerLayerUpdater.Snapshot) : ConfirmAction()
     /** The "?" explainer next to the card's update button. */

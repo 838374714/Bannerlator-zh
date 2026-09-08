@@ -37,6 +37,9 @@ class ContainersViewModel(app: Application) : AndroidViewModel(app) {
 
     private val _layerSnapshots = MutableStateFlow<Map<Int, ContainerLayerUpdater.Snapshot>>(emptyMap())
     val layerSnapshots: StateFlow<Map<Int, ContainerLayerUpdater.Snapshot>> = _layerSnapshots
+    private val _layerCurrentMissing = MutableStateFlow<Set<Int>>(emptySet())
+    /** Containers whose CURRENT layer is no longer installed: an update cannot be reverted. */
+    val layerCurrentMissing: StateFlow<Set<Int>> = _layerCurrentMissing
 
     // Blocking progress text while an update/revert runs (null = idle).
     private val _layerBusy = MutableStateFlow<String?>(null)
@@ -62,14 +65,22 @@ class ContainersViewModel(app: Application) : AndroidViewModel(app) {
             val contents = ContentsManager(getApplication()).apply { syncContents() }
             val updates = HashMap<Int, String>()
             val snapshots = HashMap<Int, ContainerLayerUpdater.Snapshot>()
+            val currentMissing = HashSet<Int>()
             for (c in list) {
-                layerUpdater.findNewerInstalled(contents, c)?.let { updates[c.id] = it }
+                layerUpdater.findNewerInstalled(contents, c)?.let { target ->
+                    updates[c.id] = target
+                    // The confirm dialog promises a revert; only true while the current layer's
+                    // files are still on the device (an uninstalled old layer = update only).
+                    val cur = contents.getProfileByEntryName(c.wineVersion)
+                    if (cur == null || !ContentsManager.getInstallDir(getApplication(), cur).isDirectory) currentMissing.add(c.id)
+                }
                 layerUpdater.latestSnapshot(c)
                     ?.takeIf { it.oldEntry != c.wineVersion }
                     ?.let { snapshots[c.id] = it }
             }
             _layerUpdates.value = updates
             _layerSnapshots.value = snapshots
+            _layerCurrentMissing.value = currentMissing
         }
     }
 
