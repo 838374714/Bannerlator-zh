@@ -10,6 +10,9 @@ import com.winlator.star.core.WineInfo
 import com.winlator.star.xenvironment.ImageFs
 import org.json.JSONObject
 import java.io.File
+import java.net.HttpURLConnection
+import java.net.URL
+import java.util.concurrent.ConcurrentHashMap
 
 /**
  * In-place Proton/Wine layer swap for an existing container.
@@ -26,13 +29,29 @@ import java.io.File
  * `<container>/.layer-update-backup/<epoch>/` so [revert] can put the container back on the old
  * layer (which stays installed — the updater never removes layers).
  *
- * r1 scope: same `type` + same profile `versionName` (hence same arch), strictly higher `verCode`,
- * installed layers only. TODO(cross-line): moving between lines (11.0-2 → 11.0-6, GE ↔ plain) is
- * deliberately not offered here — registry defaults, DirectAudio support and game fixes differ.
+ * Scope: same `type` + same profile `versionName` (hence same arch), strictly higher `verCode`.
+ * [findNewerInstalled] covers layers already on the device; [findNewerInCatalog] covers a newer
+ * build that only exists in the online catalog (the caller downloads it through the normal
+ * contents path first, then runs [update] against the INSTALLED entry). TODO(cross-line): moving
+ * between lines (11.0-2 → 11.0-6, GE ↔ plain) is deliberately not offered here — registry
+ * defaults, DirectAudio support and game fixes differ.
  */
 class ContainerLayerUpdater(private val context: Context) {
 
     data class Snapshot(val dir: File, val oldEntry: String, val newEntry: String, val time: Long)
+
+    /**
+     * A newer build of a container's layer line that is NOT installed yet. [entryName] is the entry
+     * the download will create (`Proton-11.0-6-arm64ec-6`); [profile] is the catalog row itself,
+     * the thing the contents downloader takes. [sizeBytes] is filled by [probeRemoteSize] when known.
+     */
+    data class CatalogCandidate(
+        val entryName: String,
+        val remoteUrl: String,
+        val verCode: Int,
+        val profile: ContentProfile,
+        val sizeBytes: Long? = null,
+    )
 
     /** A parsed contents entry name `<Type>-<versionName>-<verCode>`. */
     private data class Entry(val type: ContentProfile.ContentType, val versionName: String, val verCode: Int)
@@ -52,6 +71,35 @@ class ContainerLayerUpdater(private val context: Context) {
             .filter { ContentsManager.getInstallDir(context, it).isDirectory }
             .maxByOrNull { it.verCode } ?: return null
         return ContentsManager.getEntryName(best)
+    }
+
+    /**
+     * The best catalog row for [container]'s line that is newer than BOTH the container's layer and
+     * anything installed ([findNewerInstalled]) — so an installed newer layer always wins and takes
+     * the plain installed path. Only rows carrying the catalog's `versionName` field take part;
+     * a display label is never parsed into a line. Same type, same line, same arch (the arch is the
+     * line's suffix, so an equal line implies it — checked anyway as the guardrail it is), and the
+     * row's install dir must not exist (an installed copy is [findNewerInstalled]'s business).
+     * [contentsManager] must have its remote profiles set and be synced; no network here.
+     */
+    fun findNewerInCatalog(contentsManager: ContentsManager, container: Container): CatalogCandidate? {
+        val current = container.wineVersion
+        if (WineInfo.isMainWineVersion(current)) return null
+        val entry = parseEntry(current) ?: return null
+        val floor = findNewerInstalled(contentsManager, container)
+            ?.let { parseEntry(it)?.verCode }
+            ?.coerceAtLeast(entry.verCode) ?: entry.verCode
+        val arch = archOf(entry.versionName)
+        val best = (contentsManager.getProfiles(entry.type) ?: return null)
+            .filter { !it.remoteUrl.isNullOrEmpty() && it.type == entry.type }
+            .filter { it.versionName == entry.versionName && archOf(it.versionName) == arch }
+            .filter { it.verCode > floor }
+            .filter { !ContentsManager.getInstallDir(context, it).isDirectory }
+            .maxByOrNull { it.verCode } ?: return null
+        // Entry the wcp will install as: its profile.json carries versionName + verCode, which is what
+        // the catalog row mirrors (the profile is re-read after download — see the ViewModel).
+        val entryName = "${entry.type}-${best.versionName}-${best.verCode}"
+        return CatalogCandidate(entryName, best.remoteUrl, best.verCode, best)
     }
 
     /** The most recent snapshot taken by [update] for [container], or null. */
@@ -196,6 +244,39 @@ class ContainerLayerUpdater(private val context: Context) {
     companion object {
         private const val TAG = "ContainerLayerUpdater"
         const val BACKUP_DIR = ".layer-update-backup"
+        private val ARCH_SUFFIXES = listOf("-arm64ec", "-x86_64", "-x86")
+        private val remoteSizes = ConcurrentHashMap<String, Long>()
+
+        /** `arm64ec` / `x86_64` / `x86` from a line name's suffix, or "" when it carries none. */
+        fun archOf(versionName: String?): String =
+            ARCH_SUFFIXES.firstOrNull { versionName?.endsWith(it) == true }?.substring(1) ?: ""
+
+        /**
+         * Content-Length of [url] via one HEAD (redirects followed), cached per url for the process;
+         * null when unknown or on any error. Short timeouts — this only feeds the "(~size)" hint.
+         */
+        fun probeRemoteSize(url: String): Long? {
+            remoteSizes[url]?.let { return it }
+            return try {
+                val conn = URL(url).openConnection() as HttpURLConnection
+                conn.requestMethod = "HEAD"
+                conn.instanceFollowRedirects = true
+                conn.connectTimeout = 4000
+                conn.readTimeout = 4000
+                val len = conn.contentLengthLong
+                conn.disconnect()
+                len.takeIf { it > 0 }?.also { remoteSizes[url] = it }
+            } catch (e: Exception) {
+                null
+            }
+        }
+
+        /** "1.2 GB" / "340 MB" for the download hint. */
+        fun formatSize(bytes: Long): String = when {
+            bytes >= 1L shl 30 -> String.format("%.1f GB", bytes / (1024.0 * 1024 * 1024))
+            bytes >= 1L shl 20 -> "${bytes / (1024 * 1024)} MB"
+            else -> "${(bytes + 1023) / 1024} KB"
+        }
         private const val MANIFEST = "manifest.json"
         private val SNAPSHOT_FILES = listOf(".container", ".wine/system.reg", ".wine/user.reg", ".wine/userdef.reg")
 
