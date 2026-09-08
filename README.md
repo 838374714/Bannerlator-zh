@@ -79,7 +79,7 @@ Before any **stable release** is published, all changes are **manually debugged 
 |---|---|
 | **App label** | `Bannerlator Bionic` (standard) · `Bannerlator Bionic PuBG` (pubg) · `Bannerlator Bionic Ludashi` (ludashi) |
 | **Packages** | `com.winlator.banner` (standard) · `com.tencent.ig` (pubg) · `com.ludashi.benchmark` (ludashi) |
-| **Version** | Bannerlator **V 3.0.7** — built from Star **marcescence** (`versionName 3.0.7`, `versionCode 81`) |
+| **Version** | Bannerlator **V 3.0.8** — built from Star **marcescence** (`versionName 3.0.8`, `versionCode 82`) |
 | **Android SDK** | `compileSdk 34` · `targetSdk 28` · `minSdk 26` (Android 8.0+) |
 | **Lineage** | Winlator → cmod → Bionic Nightly → Star Bionic → **marcescence** → **Bannerlator** |
 
@@ -111,7 +111,7 @@ Every report gets its own **public discussion thread**. You can reply as the ori
 - [🤖 AI Disclaimer](#-ai-disclaimer)
 - [ℹ️ Information](#ℹ️-information)
 - [🐛 Report a Mali GPU Issue](#-report-a-mali-gpu-game-issue)
-- [🆕 What's New in 3.0.7](#-whats-new-in-307)
+- [🆕 What's New in 3.0.8](#-whats-new-in-308)
 - [🎞️ Frame Generation & Present Modes](#-frame-generation--present-modes)
 - [✨ Full Features](#-full-features)
 - [🎨 Adding your own ReShade effects](#-adding-your-own-reshade-effects)
@@ -124,9 +124,20 @@ Every report gets its own **public discussion thread**. You can reply as the ori
 
 ---
 
-## 🆕 What's New in 3.0.7
+## 🆕 What's New in 3.0.8
 
-**The EA update.** EA-published games in your **Steam library** launch the way they do on a PC — Steam starts EA Desktop, EA Desktop starts the game — and Bannerlator runs the whole chain for you. Entirely app-side — **no ImageFS reinstall**; install over 3.0.6 and everything carries over. Full notes: [`docs/releases/3.0.7.md`](docs/releases/3.0.7.md). **A first for the Winlator family.** Bannerlator is the first emulator outside GameHub to offer EA titles from your Steam library, and with each release it moves closer to 1:1 parity with the features GameHub offers and supports — a big win for the Winlator community and its forks.
+**The downloads-and-containers update.** Epic, GOG and Amazon downloads move onto the same Rust engine Steam uses — two to nearly three times faster on the same titles. Containers are no longer stuck on the compatibility layer they were created with: when a newer layer appears, the container card offers **Update layer**, downloads it if needed, keeps your games, saves, shortcuts and settings, and can put the old one back. New `-arm64ec-5` layers fix the Denuvo unwinder crash (**Need for Speed Heat** now reaches gameplay). Also: one-tap **Screen Effect Looks**, a **Media tab** on every store page, and the file-manager and EA fixes reported since 3.0.7. Entirely app-side — **no ImageFS reinstall**; install over 3.0.7 and everything carries over. Full notes: [`docs/releases/3.0.8.md`](docs/releases/3.0.8.md).
+
+- **⬇️ Epic, GOG and Amazon downloads on the Rust engine.** The last three Java download managers are replaced by the adaptive-concurrency engine Steam already uses. Same title, same Wi-Fi: GOG 4.5 s → **2.2 s**, Epic 11.4 s → **4.3 s**, Amazon 68 s → **48 s**. A **Store download speed** row in Log Manager (Slow/Medium/Fast/Blazing, default Fast) sets how many pieces are pulled at once; the Java engines stay as a fallback.
+- **🔄 Update a container's compatibility layer in place.** When a newer build of your container's layer exists, the container card offers **Update layer → vN** with a **?** explainer. It backs up the registry, switches the layer and refreshes only Wine's own files — **games, saves, shortcuts and container settings are kept**, DXVK / FEX / game files untouched. If the layer is only in the catalog it is downloaded first. The old layer stays installed and **Revert layer** is in the ⋮ menu.
+- **📦 New `-arm64ec-5` compatibility layers.** All seven Proton / GE-Proton layers rebuilt ([`build-bionic-layers-20260907-eccode`](https://github.com/The412Banner/proton-wine/releases/tag/build-bionic-layers-20260907-eccode), now the catalog default): a Wine `RtlIsEcCode` bounds check that stops Denuvo-protected games dying in the exception unwinder (**Need for Speed Heat** now reaches gameplay), DirectAudio v1.3.2, and one `.wcp` per layer for both 4 KB and 16 KB page sizes. *Heat also needs a **stable** FEXCore build — see the release notes.*
+- **🎨 Screen Effect "Looks".** One-tap presets heading the drawer's Screen Effects section on both renderer paths — Game Clarity, Vivid, Cinematic, Competitive, Filmic, Arcade, Retro CRT and more — plus a new **Saturation** control on both paths so the colour Looks grade identically.
+- **🛒 Store Media tab.** Screenshots and trailers on the Steam, GOG, Epic and Amazon detail pages; the official catalog can also be used as a Contents repository, and a download can be kept as a save archive only.
+- **🛠️ Fixes.** File manager: the up arrow and Back work after opening a Favorite or a side-bar shortcut, and every folder lists a **`..`** row ([#476](https://github.com/The412Banner/Bannerlator/issues/476)); EA setup finds games added before EA support existed (the Need for Speed Heat "couldn't locate the install folder" report); layers with a version code of 10 or higher resolve instead of falling back to Proton 9; Relative Mouse saved per game ([#431](https://github.com/The412Banner/Bannerlator/issues/431)); uniform file-manager card height ([#475](https://github.com/The412Banner/Bannerlator/issues/475)); the launch failure card's Close works from the Games screen.
+
+### 🆕 Earlier — 3.0.7 (the EA update)
+
+**EA-published games from your Steam library** launch the way they do on a PC — Steam starts EA Desktop, EA Desktop starts the game. A one-time **Set up EA Desktop** session per container, an **EA** badge on detected titles, a card naming EA's reason when it refuses a licence, `-arm64ec-4` layers with the EA networking and installer fixes, and a rebuilt **Input Controls import** flow with live previews. Full notes: [`docs/releases/3.0.7.md`](docs/releases/3.0.7.md).
 
 - **🎮 EA games from your Steam library.** Origin-era and EA-app-era titles are detected and get an **EA** badge. The first launch offers a one-time **Set up EA Desktop** session (you click through EA's installer; the app handles Mono, Gecko, the registry and the Steam install script). After that it is press-play: the game starts through Steam and EA Desktop in the right order, and the session stays alive through EA's hand-offs. Device-proven with **Need for Speed Payback / Most Wanted (2012) / Rivals** and **STAR WARS Jedi: Survivor**. Needs the **SteamLite** launch mode (selected and remembered for EA titles), the new **`-4` compatibility layers** from the catalog and the hosted **SteamLite v7** client. Titles using EA's Javelin anti-cheat are refused up front. *Researched and implemented by The412Banner by reverse-engineering GameHub's EA launch methods and techniques.*
 - **📦 New compatibility layers.** All seven Proton / GE-Proton layers rebuilt into a new `-arm64ec-4` slot ([`build-bionic-layers-20260906-eanet2`](https://github.com/The412Banner/proton-wine/releases/tag/build-bionic-layers-20260906-eanet2)): EA Desktop can go online (dual-stack DNS + a real default route) and, on the Wine 11 layers, EA's installer no longer aborts on a GDI+ assertion. Create a fresh container on a `-4` layer for EA titles; existing containers keep their layer.
