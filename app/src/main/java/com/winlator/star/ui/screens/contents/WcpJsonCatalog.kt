@@ -26,8 +26,12 @@ object WcpJsonCatalog {
             val type = obj.getString("type")
             val verName = obj.getString("verName")
             val url = obj.getString("remoteUrl")
+            // verCode is a string in the live catalog ("5") — optString reads either shape.
+            val verCode = obj.optString("verCode", "").toIntOrNull()
+            val profileVersionName = obj.optString("versionName", "").takeIf { it.isNotBlank() }
             all.add(Entry(type, RemoteSourceRepository.RemoteItem(
                 displayName = "$type  $verName", versionName = verName, downloadUrl = url, sourceName = sourceName,
+                verCode = verCode, profileVersionName = profileVersionName,
             )))
         }
         val filtered: List<Entry> = when {
