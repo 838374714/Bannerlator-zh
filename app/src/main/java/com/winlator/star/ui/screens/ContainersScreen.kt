@@ -28,6 +28,7 @@ import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
 import android.widget.Toast
 import androidx.compose.material.icons.filled.Add
+import androidx.compose.material.icons.filled.CloudDownload
 import androidx.compose.material.icons.filled.ContentCopy
 import androidx.compose.material.icons.filled.Delete
 import androidx.compose.material.icons.filled.Edit
@@ -104,6 +105,7 @@ import com.winlator.star.util.InAppFilePicker
 import com.winlator.star.core.SaveLocator
 import com.winlator.star.core.StringUtils
 import com.winlator.star.store.UninstallResultBar
+import com.winlator.star.store.download.InstallProgressDialog
 import androidx.compose.ui.text.style.TextOverflow
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
@@ -122,6 +124,8 @@ fun ContainersScreen(
     val isLoading by vm.isLoading.collectAsState()
     val message by vm.message.collectAsState()
     val layerUpdates by vm.layerUpdates.collectAsState()
+    val layerUpdateRemote by vm.layerUpdateRemote.collectAsState()
+    val layerDownload by vm.layerDownload.collectAsState()
     val layerSnapshots by vm.layerSnapshots.collectAsState()
     val layerCurrentMissing by vm.layerCurrentMissing.collectAsState()
     val layerBusy by vm.layerBusy.collectAsState()
@@ -242,11 +246,21 @@ fun ContainersScreen(
                         onInfo = { storageInfoContainer = container },
                         onBackupRestore = { saveFlow = SaveFlow.Fork(container) },
                         layerUpdate = layerUpdates[container.id],
+                        layerUpdateRemote = layerUpdateRemote[container.id],
                         layerSnapshot = layerSnapshots[container.id],
-                        onUpdateLayer = { target -> confirmDialog = ConfirmAction.UpdateLayer(container, target, revertable = container.id !in layerCurrentMissing) },
+                        onUpdateLayer = { target ->
+                            confirmDialog = ConfirmAction.UpdateLayer(
+                                container, target,
+                                revertable = container.id !in layerCurrentMissing,
+                                remote = layerUpdateRemote[container.id]?.takeIf { it.entryName == target },
+                            )
+                        },
                         onRevertLayer = { snapshot -> confirmDialog = ConfirmAction.RevertLayer(container, snapshot) },
                         onLayerHelp = { target ->
-                            confirmDialog = ConfirmAction.LayerHelp(container, target, layerSnapshots[container.id])
+                            confirmDialog = ConfirmAction.LayerHelp(
+                                container, target, layerSnapshots[container.id],
+                                remote = layerUpdateRemote[container.id]?.takeIf { it.entryName == target },
+                            )
                         },
                     )
                 }
@@ -364,12 +378,17 @@ fun ContainersScreen(
             is ConfirmAction.UpdateLayer -> {
                 val newLabel = ContainerLayerUpdater.codeLabel(action.target)
                 val oldLabel = ContainerLayerUpdater.codeLabel(action.container.wineVersion)
+                val remote = action.remote
                 OutlinedAlertDialog(
                     onDismissRequest = { confirmDialog = null },
-                    title = { Text("Update layer to $newLabel?") },
+                    title = { Text(if (remote != null) "Download and update layer to $newLabel?" else "Update layer to $newLabel?") },
                     text = {
                         Text(
                             "\"${action.container.name}\" moves from ${action.container.wineVersion} to ${action.target}.\n\n" +
+                                (if (remote != null)
+                                    "The $newLabel layer is not on this device yet: it is downloaded from the catalog" +
+                                        layerSizeHint(remote) + " and installed first, then the container is updated.\n\n"
+                                else "") +
                                 "What changes: the Wine/Proton layer files (system32/syswow64 builtin DLLs are refreshed; " +
                                 "DXVK, FEX/Box64 and game-installed files are left as they are). Wine finishes its own " +
                                 "prefix update on the next launch.\n\n" +
@@ -386,8 +405,9 @@ fun ContainersScreen(
                     confirmButton = {
                         TextButton(onClick = {
                             confirmDialog = null
-                            vm.updateLayer(action.container, action.target)
-                        }) { Text("Update") }
+                            if (remote != null) vm.downloadAndUpdateLayer(action.container, remote)
+                            else vm.updateLayer(action.container, action.target)
+                        }) { Text(if (remote != null) "Download & update" else "Update") }
                     },
                     dismissButton = {
                         TextButton(onClick = { confirmDialog = null }) { Text("Cancel") }
@@ -404,7 +424,10 @@ fun ContainersScreen(
                             Text(
                                 "A layer is the set of Wine/Proton files a container runs on. " +
                                     "\"${action.container.name}\" runs on ${action.container.wineVersion}; a newer build " +
-                                    "of the same layer, ${action.target}, is installed.\n\n" +
+                                    "of the same layer, ${action.target}, is " +
+                                    (if (action.remote != null) "available in the catalog. The $newLabel layer will be " +
+                                        "downloaded" + layerSizeHint(action.remote) + " first."
+                                    else "installed.") + "\n\n" +
                                     "What the update changes: only Wine's own files inside the container are refreshed to " +
                                     "the new version. DXVK, FEX/Box64 and anything a game installed are left as they are; " +
                                     "Wine finishes its own prefix update on the next launch.\n\n" +
@@ -426,8 +449,12 @@ fun ContainersScreen(
                     },
                     confirmButton = {
                         TextButton(onClick = {
-                            confirmDialog = ConfirmAction.UpdateLayer(action.container, action.target, revertable = action.container.id !in layerCurrentMissing)
-                        }) { Text("Update to $newLabel…") }
+                            confirmDialog = ConfirmAction.UpdateLayer(
+                                action.container, action.target,
+                                revertable = action.container.id !in layerCurrentMissing,
+                                remote = action.remote,
+                            )
+                        }) { Text(if (action.remote != null) "Download & update to $newLabel…" else "Update to $newLabel…") }
                     },
                     dismissButton = {
                         TextButton(onClick = { confirmDialog = null }) { Text("Close") }
@@ -464,6 +491,16 @@ fun ContainersScreen(
     }
 
     layerBusy?.let { SaveFlowProgressDialog(message = it) }
+    // Catalog download+install that precedes a remote layer update — the same popup the component
+    // sheet and the Contents hub use (live phase/percent, Cancel while running). On success the VM
+    // closes it itself and continues with the update; a failure stays up until closed.
+    layerDownload?.let { st ->
+        InstallProgressDialog(
+            state = st,
+            onCancel = { vm.cancelLayerDownload() },
+            onDismiss = { vm.layerDownloadDismissed() },
+        )
+    }
 
     // Storage info dialog
     storageInfoContainer?.let { container ->
@@ -641,6 +678,7 @@ private fun ContainerItem(
     onInfo: () -> Unit,
     onBackupRestore: () -> Unit,
     layerUpdate: String? = null,
+    layerUpdateRemote: ContainerLayerUpdater.CatalogCandidate? = null,
     layerSnapshot: ContainerLayerUpdater.Snapshot? = null,
     onUpdateLayer: (target: String) -> Unit = {},
     onRevertLayer: (snapshot: ContainerLayerUpdater.Snapshot) -> Unit = {},
@@ -714,10 +752,14 @@ private fun ContainerItem(
                         overflow = TextOverflow.Ellipsis,
                     )
                 }
-                // A newer build of this container's layer line is installed (ContainerLayerUpdater):
-                // compact update button + "?" explainer right under the layer subtitle. The overflow
-                // menu carries the same action (and Revert) for discoverability.
-                if (layerUpdate != null) {
+                // A newer build of this container's layer line is installed — or, failing that, in the
+                // online catalog (ContainerLayerUpdater): compact update button + "?" explainer right
+                // under the layer subtitle. The catalog case adds a download glyph in front of the
+                // label (the layer is fetched first). The overflow menu carries the same action (and
+                // Revert) for discoverability.
+                val layerTarget = layerUpdate ?: layerUpdateRemote?.entryName
+                val layerNeedsDownload = layerUpdate == null && layerUpdateRemote != null
+                if (layerTarget != null) {
                     Row(
                         verticalAlignment = Alignment.CenterVertically,
                         modifier = Modifier.padding(top = 4.dp),
@@ -726,13 +768,21 @@ private fun ContainerItem(
                         // against the dark card (user request on the r1 screenshot).
                         val layerOutline = MaterialTheme.colorScheme.primary.copy(alpha = 0.55f)
                         FilledTonalButton(
-                            onClick = { onUpdateLayer(layerUpdate) },
+                            onClick = { onUpdateLayer(layerTarget) },
                             contentPadding = PaddingValues(horizontal = 10.dp, vertical = 0.dp),
                             border = BorderStroke(1.dp, layerOutline),
                             modifier = Modifier.height(26.dp),
                         ) {
+                            if (layerNeedsDownload) {
+                                Icon(
+                                    imageVector = Icons.Filled.CloudDownload,
+                                    contentDescription = "Download needed",
+                                    modifier = Modifier.size(14.dp),
+                                )
+                                Spacer(Modifier.width(4.dp))
+                            }
                             Text(
-                                text = "Update layer \u2192 ${ContainerLayerUpdater.codeLabel(layerUpdate)}",
+                                text = "Update layer \u2192 ${ContainerLayerUpdater.codeLabel(layerTarget)}",
                                 style = MaterialTheme.typography.labelSmall,
                                 fontWeight = FontWeight.Bold,
                                 maxLines = 1,
@@ -740,7 +790,7 @@ private fun ContainerItem(
                         }
                         Spacer(Modifier.width(6.dp))
                         IconButton(
-                            onClick = { onLayerHelp(layerUpdate) },
+                            onClick = { onLayerHelp(layerTarget) },
                             modifier = Modifier.size(26.dp),
                         ) {
                             Icon(
@@ -826,12 +876,15 @@ private fun ContainerItem(
                         leadingIcon = { Icon(Icons.Filled.SettingsBackupRestore, null) },
                         onClick = { menuExpanded = false; onBackupRestore() },
                     )
-                    if (layerUpdate != null) {
+                    if (layerTarget != null) {
                         MenuItemDivider()
                         DropdownMenuItem(
-                            text = { Text("Update layer to ${ContainerLayerUpdater.codeLabel(layerUpdate)}…") },
-                            leadingIcon = { Icon(Icons.Filled.Upgrade, null) },
-                            onClick = { menuExpanded = false; onUpdateLayer(layerUpdate) },
+                            text = {
+                                val label = ContainerLayerUpdater.codeLabel(layerTarget)
+                                Text(if (layerNeedsDownload) "Download & update layer to $label…" else "Update layer to $label…")
+                            },
+                            leadingIcon = { Icon(if (layerNeedsDownload) Icons.Filled.CloudDownload else Icons.Filled.Upgrade, null) },
+                            onClick = { menuExpanded = false; onUpdateLayer(layerTarget) },
                         )
                     }
                     if (layerSnapshot != null) {
@@ -857,13 +910,30 @@ private fun ContainerItem(
 private sealed class ConfirmAction {
     data class Duplicate(val container: Container) : ConfirmAction()
     data class Remove(val container: Container) : ConfirmAction()
-    /** In-place layer update to the installed entry [target] (ContainerLayerUpdater). */
-    data class UpdateLayer(val container: Container, val target: String, val revertable: Boolean = true) : ConfirmAction()
+    /**
+     * In-place layer update to [target] (ContainerLayerUpdater). [remote] is set when the target is a
+     * catalog-only build that has to be downloaded and installed first.
+     */
+    data class UpdateLayer(
+        val container: Container,
+        val target: String,
+        val revertable: Boolean = true,
+        val remote: ContainerLayerUpdater.CatalogCandidate? = null,
+    ) : ConfirmAction()
     /** Revert a previous layer update using its [snapshot]. */
     data class RevertLayer(val container: Container, val snapshot: ContainerLayerUpdater.Snapshot) : ConfirmAction()
     /** The "?" explainer next to the card's update button. */
-    data class LayerHelp(val container: Container, val target: String, val snapshot: ContainerLayerUpdater.Snapshot?) : ConfirmAction()
+    data class LayerHelp(
+        val container: Container,
+        val target: String,
+        val snapshot: ContainerLayerUpdater.Snapshot?,
+        val remote: ContainerLayerUpdater.CatalogCandidate? = null,
+    ) : ConfirmAction()
 }
+
+/** " (~340 MB)" when the catalog download size is known, "" otherwise. */
+private fun layerSizeHint(remote: ContainerLayerUpdater.CatalogCandidate): String =
+    remote.sizeBytes?.let { " (~${ContainerLayerUpdater.formatSize(it)})" } ?: ""
 
 /** Steps of the Backup / Restore game-save flow launched from a container's overflow menu. */
 private sealed class SaveFlow {
