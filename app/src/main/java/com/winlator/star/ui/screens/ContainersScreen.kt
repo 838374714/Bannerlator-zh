@@ -686,6 +686,11 @@ private fun ContainerItem(
 ) {
     var menuExpanded by remember { mutableStateOf(false) }
 
+    // Layer-update target for both the card button and the overflow menu: an INSTALLED newer layer
+    // wins over a catalog-only one (no download needed then).
+    val layerTarget = layerUpdate ?: layerUpdateRemote?.entryName
+    val layerNeedsDownload = layerUpdate == null && layerUpdateRemote != null
+
     // Resolved component metadata (same theme as the Shortcuts game cards).
     val (dxvkVersion, vkd3dVersion) = parseDxwrapperConfig(container.getDXWrapperConfig())
     val driverCfg = container.getGraphicsDriverConfig()
@@ -757,8 +762,6 @@ private fun ContainerItem(
                 // under the layer subtitle. The catalog case adds a download glyph in front of the
                 // label (the layer is fetched first). The overflow menu carries the same action (and
                 // Revert) for discoverability.
-                val layerTarget = layerUpdate ?: layerUpdateRemote?.entryName
-                val layerNeedsDownload = layerUpdate == null && layerUpdateRemote != null
                 if (layerTarget != null) {
                     Row(
                         verticalAlignment = Alignment.CenterVertically,
@@ -877,14 +880,15 @@ private fun ContainerItem(
                         onClick = { menuExpanded = false; onBackupRestore() },
                     )
                     if (layerTarget != null) {
+                        val menuTarget: String = layerTarget
                         MenuItemDivider()
                         DropdownMenuItem(
                             text = {
-                                val label = ContainerLayerUpdater.codeLabel(layerTarget)
+                                val label = ContainerLayerUpdater.codeLabel(menuTarget)
                                 Text(if (layerNeedsDownload) "Download & update layer to $label…" else "Update layer to $label…")
                             },
                             leadingIcon = { Icon(if (layerNeedsDownload) Icons.Filled.CloudDownload else Icons.Filled.Upgrade, null) },
-                            onClick = { menuExpanded = false; onUpdateLayer(layerTarget) },
+                            onClick = { menuExpanded = false; onUpdateLayer(menuTarget) },
                         )
                     }
                     if (layerSnapshot != null) {
