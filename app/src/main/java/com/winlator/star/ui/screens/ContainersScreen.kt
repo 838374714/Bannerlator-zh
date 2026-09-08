@@ -4,6 +4,7 @@ import android.app.Activity
 import android.content.Intent
 import android.net.Uri
 import androidx.compose.foundation.BorderStroke
+import androidx.compose.foundation.border
 import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
@@ -37,6 +38,11 @@ import androidx.compose.ui.res.painterResource
 import androidx.compose.ui.res.painterResource
 import androidx.compose.material.icons.filled.Settings
 import androidx.compose.material.icons.filled.SettingsBackupRestore
+import androidx.compose.material.icons.filled.HelpOutline
+import androidx.compose.material.icons.filled.Upgrade
+import androidx.compose.foundation.layout.PaddingValues
+import androidx.compose.foundation.layout.height
+import androidx.compose.material3.FilledTonalButton
 import java.io.File
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Card
@@ -88,6 +94,7 @@ import com.winlator.star.R
 import com.winlator.star.XServerDisplayActivity
 import com.winlator.star.XrActivity
 import com.winlator.star.container.Container
+import com.winlator.star.container.ContainerLayerUpdater
 import com.winlator.star.container.Shortcut
 import com.winlator.star.store.SteamFriendsAction
 import com.winlator.star.contentdialog.GraphicsDriverConfigDialog
@@ -114,6 +121,10 @@ fun ContainersScreen(
     val containers by vm.containers.collectAsState()
     val isLoading by vm.isLoading.collectAsState()
     val message by vm.message.collectAsState()
+    val layerUpdates by vm.layerUpdates.collectAsState()
+    val layerSnapshots by vm.layerSnapshots.collectAsState()
+    val layerCurrentMissing by vm.layerCurrentMissing.collectAsState()
+    val layerBusy by vm.layerBusy.collectAsState()
     val context = LocalContext.current
     val activity = context as Activity
 
@@ -230,6 +241,13 @@ fun ContainersScreen(
                         },
                         onInfo = { storageInfoContainer = container },
                         onBackupRestore = { saveFlow = SaveFlow.Fork(container) },
+                        layerUpdate = layerUpdates[container.id],
+                        layerSnapshot = layerSnapshots[container.id],
+                        onUpdateLayer = { target -> confirmDialog = ConfirmAction.UpdateLayer(container, target, revertable = container.id !in layerCurrentMissing) },
+                        onRevertLayer = { snapshot -> confirmDialog = ConfirmAction.RevertLayer(container, snapshot) },
+                        onLayerHelp = { target ->
+                            confirmDialog = ConfirmAction.LayerHelp(container, target, layerSnapshots[container.id])
+                        },
                     )
                 }
             }
@@ -343,8 +361,109 @@ fun ContainersScreen(
                     },
                 )
             }
+            is ConfirmAction.UpdateLayer -> {
+                val newLabel = ContainerLayerUpdater.codeLabel(action.target)
+                val oldLabel = ContainerLayerUpdater.codeLabel(action.container.wineVersion)
+                OutlinedAlertDialog(
+                    onDismissRequest = { confirmDialog = null },
+                    title = { Text("Update layer to $newLabel?") },
+                    text = {
+                        Text(
+                            "\"${action.container.name}\" moves from ${action.container.wineVersion} to ${action.target}.\n\n" +
+                                "What changes: the Wine/Proton layer files (system32/syswow64 builtin DLLs are refreshed; " +
+                                "DXVK, FEX/Box64 and game-installed files are left as they are). Wine finishes its own " +
+                                "prefix update on the next launch.\n\n" +
+                                "What is kept: games, saves, shortcuts and container settings.\n\n" +
+                                (if (action.revertable)
+                                    "The $oldLabel layer stays installed and a backup of the registry is taken, so you can " +
+                                        "revert from this menu. "
+                                else
+                                    "The $oldLabel layer is no longer installed on this device, so this update cannot be " +
+                                        "reverted afterwards (a registry backup is still taken). ") +
+                                "Make sure nothing is running in this container."
+                        )
+                    },
+                    confirmButton = {
+                        TextButton(onClick = {
+                            confirmDialog = null
+                            vm.updateLayer(action.container, action.target)
+                        }) { Text("Update") }
+                    },
+                    dismissButton = {
+                        TextButton(onClick = { confirmDialog = null }) { Text("Cancel") }
+                    },
+                )
+            }
+            is ConfirmAction.LayerHelp -> {
+                val newLabel = ContainerLayerUpdater.codeLabel(action.target)
+                OutlinedAlertDialog(
+                    onDismissRequest = { confirmDialog = null },
+                    title = { Text("About layer updates") },
+                    text = {
+                        Column(modifier = Modifier.verticalScroll(rememberScrollState())) {
+                            Text(
+                                "A layer is the set of Wine/Proton files a container runs on. " +
+                                    "\"${action.container.name}\" runs on ${action.container.wineVersion}; a newer build " +
+                                    "of the same layer, ${action.target}, is installed.\n\n" +
+                                    "What the update changes: only Wine's own files inside the container are refreshed to " +
+                                    "the new version. DXVK, FEX/Box64 and anything a game installed are left as they are; " +
+                                    "Wine finishes its own prefix update on the next launch.\n\n" +
+                                    "What is kept: installed games, saves, shortcuts and container settings.\n\n" +
+                                    "The old layer stays installed and a backup of the registry is taken first, so " +
+                                    "\"Revert layer\" is available from this container's menu afterwards.\n\n" +
+                                    "Close the game before updating."
+                            )
+                            if (action.snapshot != null) {
+                                Text(
+                                    text = "A ${ContainerLayerUpdater.codeLabel(action.snapshot.oldEntry)} snapshot from an " +
+                                        "earlier update exists — revert is available in the menu.",
+                                    style = MaterialTheme.typography.bodySmall,
+                                    color = OnSurfaceVariant,
+                                    modifier = Modifier.padding(top = 12.dp),
+                                )
+                            }
+                        }
+                    },
+                    confirmButton = {
+                        TextButton(onClick = {
+                            confirmDialog = ConfirmAction.UpdateLayer(action.container, action.target, revertable = action.container.id !in layerCurrentMissing)
+                        }) { Text("Update to $newLabel…") }
+                    },
+                    dismissButton = {
+                        TextButton(onClick = { confirmDialog = null }) { Text("Close") }
+                    },
+                )
+            }
+            is ConfirmAction.RevertLayer -> {
+                val oldLabel = ContainerLayerUpdater.codeLabel(action.snapshot.oldEntry)
+                OutlinedAlertDialog(
+                    onDismissRequest = { confirmDialog = null },
+                    title = { Text("Revert layer to $oldLabel?") },
+                    text = {
+                        Text(
+                            "\"${action.container.name}\" goes back from ${action.container.wineVersion} to " +
+                                "${action.snapshot.oldEntry}.\n\n" +
+                                "The registry is restored from the backup taken before the update (registry changes made " +
+                                "since then are discarded) and the builtin DLLs are refreshed from the $oldLabel layer. " +
+                                "Games, saves, shortcuts and container settings are kept. Requires the $oldLabel layer to " +
+                                "still be installed."
+                        )
+                    },
+                    confirmButton = {
+                        TextButton(onClick = {
+                            confirmDialog = null
+                            vm.revertLayer(action.container, action.snapshot)
+                        }) { Text("Revert") }
+                    },
+                    dismissButton = {
+                        TextButton(onClick = { confirmDialog = null }) { Text("Cancel") }
+                    },
+                )
+            }
         }
     }
+
+    layerBusy?.let { SaveFlowProgressDialog(message = it) }
 
     // Storage info dialog
     storageInfoContainer?.let { container ->
@@ -521,6 +640,11 @@ private fun ContainerItem(
     onExport: () -> Unit,
     onInfo: () -> Unit,
     onBackupRestore: () -> Unit,
+    layerUpdate: String? = null,
+    layerSnapshot: ContainerLayerUpdater.Snapshot? = null,
+    onUpdateLayer: (target: String) -> Unit = {},
+    onRevertLayer: (snapshot: ContainerLayerUpdater.Snapshot) -> Unit = {},
+    onLayerHelp: (target: String) -> Unit = {},
 ) {
     var menuExpanded by remember { mutableStateOf(false) }
 
@@ -589,6 +713,44 @@ private fun ContainerItem(
                         maxLines = 1,
                         overflow = TextOverflow.Ellipsis,
                     )
+                }
+                // A newer build of this container's layer line is installed (ContainerLayerUpdater):
+                // compact update button + "?" explainer right under the layer subtitle. The overflow
+                // menu carries the same action (and Revert) for discoverability.
+                if (layerUpdate != null) {
+                    Row(
+                        verticalAlignment = Alignment.CenterVertically,
+                        modifier = Modifier.padding(top = 4.dp),
+                    ) {
+                        // Outline a shade lighter than the tonal fill so the pair reads as one control
+                        // against the dark card (user request on the r1 screenshot).
+                        val layerOutline = MaterialTheme.colorScheme.primary.copy(alpha = 0.55f)
+                        FilledTonalButton(
+                            onClick = { onUpdateLayer(layerUpdate) },
+                            contentPadding = PaddingValues(horizontal = 10.dp, vertical = 0.dp),
+                            border = BorderStroke(1.dp, layerOutline),
+                            modifier = Modifier.height(26.dp),
+                        ) {
+                            Text(
+                                text = "Update layer \u2192 ${ContainerLayerUpdater.codeLabel(layerUpdate)}",
+                                style = MaterialTheme.typography.labelSmall,
+                                fontWeight = FontWeight.Bold,
+                                maxLines = 1,
+                            )
+                        }
+                        Spacer(Modifier.width(6.dp))
+                        IconButton(
+                            onClick = { onLayerHelp(layerUpdate) },
+                            modifier = Modifier.size(26.dp),
+                        ) {
+                            Icon(
+                                imageVector = Icons.Filled.HelpOutline,
+                                contentDescription = "About layer updates",
+                                tint = MaterialTheme.colorScheme.primary,
+                                modifier = Modifier.size(16.dp),
+                            )
+                        }
+                    }
                 }
                 SpecChipRows(
                     rendererLabel = rendererLabel,
@@ -664,6 +826,22 @@ private fun ContainerItem(
                         leadingIcon = { Icon(Icons.Filled.SettingsBackupRestore, null) },
                         onClick = { menuExpanded = false; onBackupRestore() },
                     )
+                    if (layerUpdate != null) {
+                        MenuItemDivider()
+                        DropdownMenuItem(
+                            text = { Text("Update layer to ${ContainerLayerUpdater.codeLabel(layerUpdate)}…") },
+                            leadingIcon = { Icon(Icons.Filled.Upgrade, null) },
+                            onClick = { menuExpanded = false; onUpdateLayer(layerUpdate) },
+                        )
+                    }
+                    if (layerSnapshot != null) {
+                        MenuItemDivider()
+                        DropdownMenuItem(
+                            text = { Text("Revert layer to ${ContainerLayerUpdater.codeLabel(layerSnapshot.oldEntry)}…") },
+                            leadingIcon = { Icon(Icons.Filled.SettingsBackupRestore, null) },
+                            onClick = { menuExpanded = false; onRevertLayer(layerSnapshot) },
+                        )
+                    }
                     MenuItemDivider()
                     DropdownMenuItem(
                         text = { Text("Info") },
@@ -679,6 +857,12 @@ private fun ContainerItem(
 private sealed class ConfirmAction {
     data class Duplicate(val container: Container) : ConfirmAction()
     data class Remove(val container: Container) : ConfirmAction()
+    /** In-place layer update to the installed entry [target] (ContainerLayerUpdater). */
+    data class UpdateLayer(val container: Container, val target: String, val revertable: Boolean = true) : ConfirmAction()
+    /** Revert a previous layer update using its [snapshot]. */
+    data class RevertLayer(val container: Container, val snapshot: ContainerLayerUpdater.Snapshot) : ConfirmAction()
+    /** The "?" explainer next to the card's update button. */
+    data class LayerHelp(val container: Container, val target: String, val snapshot: ContainerLayerUpdater.Snapshot?) : ConfirmAction()
 }
 
 /** Steps of the Backup / Restore game-save flow launched from a container's overflow menu. */

@@ -404,24 +404,74 @@ public class ContainerManager {
     }
 
     private void extractCommonDlls(WineInfo wineInfo, String srcName, String dstName, File containerDir, OnExtractFileListener onExtractFileListener) throws JSONException {
-        File srcDir = new File(wineInfo.path + "/lib/wine/" + srcName);
+        copyLayerDlls(new File(wineInfo.path), wineInfo.isArm64EC(), srcName, dstName, containerDir, false, onExtractFileListener);
+    }
+
+    /**
+     * Copy the PE files of one arch dir of a Wine/Proton layer ({@code <layer>/lib/wine/<srcName>/})
+     * into the prefix ({@code .wine/drive_c/windows/<dstName>/}).
+     *
+     * <p>{@code overwriteBuiltins=false} is the creation rule (extractCommonDlls): a destination that
+     * already exists is left alone. {@code true} is the in-place layer-update rule: a destination is
+     * overwritten only when it is absent or still carries Wine's builtin DOS-stub signature
+     * ({@link #isWineBuiltinPe}) — the same test setupapi's fake-DLL install uses — so native
+     * overrides the layer never owned (DXVK/VKD3D/d7vk d3d*.dll + dxgi.dll, wowbox64/FEXCore DLLs,
+     * game-installed files) are never clobbered. Returns the number of files written.
+     */
+    static int copyLayerDlls(File layerDir, boolean arm64ec, String srcName, String dstName, File containerDir, boolean overwriteBuiltins, OnExtractFileListener onExtractFileListener) {
+        File srcDir = new File(layerDir, "lib/wine/" + srcName);
 
         File[] srcfiles = srcDir.listFiles(file -> file.isFile());
+        if (srcfiles == null) return 0;
 
+        int written = 0;
         for (File file : srcfiles) {
             String dllName = file.getName();
-            if (dllName.equals("iexplore.exe") && wineInfo.isArm64EC() && srcName.equals("aarch64-windows"))
-                file = new File(wineInfo.path + "/lib/wine/" + "i386-windows/iexplore.exe");
+            if (dllName.equals("iexplore.exe") && arm64ec && srcName.equals("aarch64-windows"))
+                file = new File(layerDir, "lib/wine/i386-windows/iexplore.exe");
             if (dllName.equals("tabtip.exe") || dllName.equals("icu.dll"))
                 continue;
             File dstFile = new File(containerDir, ".wine/drive_c/windows/" + dstName + "/" + dllName);
-            if (dstFile.exists()) continue;
+            if (dstFile.exists()) {
+                if (!overwriteBuiltins || !isWineBuiltinPe(dstFile)) continue;
+            }
             if (onExtractFileListener != null ) {
                 dstFile = onExtractFileListener.onExtractFile(dstFile, 0);
                 if (dstFile == null) continue;
             }
-            FileUtils.copy(file, dstFile);
+            if (FileUtils.copy(file, dstFile)) written++;
         }
+        return written;
+    }
+
+    /**
+     * Layer-update refresh of system32 + syswow64 from {@code layerDir} (see {@link #copyLayerDlls}
+     * with {@code overwriteBuiltins=true}). Mirrors the arch split of extractContainerPatternFile:
+     * arm64ec layers feed system32 from {@code aarch64-windows}, everything else from
+     * {@code x86_64-windows}; syswow64 always comes from {@code i386-windows}.
+     */
+    public static int refreshCommonDlls(File layerDir, boolean arm64ec, File containerDir) {
+        int written = copyLayerDlls(layerDir, arm64ec, arm64ec ? "aarch64-windows" : "x86_64-windows", "system32", containerDir, true, null);
+        written += copyLayerDlls(layerDir, arm64ec, "i386-windows", "syswow64", containerDir, true, null);
+        return written;
+    }
+
+    /**
+     * True when {@code file} is a PE whose DOS stub carries winebuild's marker ("Wine builtin DLL" /
+     * "Wine placeholder DLL"), i.e. a copy the layer itself produced rather than a native
+     * replacement. The marker sits right after the DOS header, so the first 256 bytes suffice.
+     */
+    public static boolean isWineBuiltinPe(File file) {
+        byte[] head = new byte[256];
+        int n;
+        try (java.io.FileInputStream in = new java.io.FileInputStream(file)) {
+            n = in.read(head);
+        } catch (java.io.IOException e) {
+            return false;
+        }
+        if (n < 64 || head[0] != 'M' || head[1] != 'Z') return false;
+        String stub = new String(head, 0, n, java.nio.charset.StandardCharsets.ISO_8859_1);
+        return stub.contains("Wine builtin DLL") || stub.contains("Wine placeholder DLL");
     }
 
     public boolean extractContainerPatternFile(Container container, String wineVersion, ContentsManager contentsManager, File containerDir, OnExtractFileListener onExtractFileListener) {
